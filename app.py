@@ -29,6 +29,9 @@ FRED_SERIES = {
     "const_emp":"SMU42979611500000001SA","nonfarm":"SMU42379800000000001SA",
     "permits_tot":"PHIL942BPPRIV","permits_1u":"PHIL942BP1FH",
     "gdp":"NGMP37980","cpi_shelter":"CUURA102SAH1","cpi_all":"CUURA102SA0",
+    # Interest rates & credit conditions
+    "fed_funds":"FEDFUNDS","treasury_10y":"GS10","mortgage_30y":"MORTGAGE30US",
+    "treasury_2y":"GS2","spread_10y2y":"T10Y2Y",
 }
 C = {"gold":"#C8A951","slate":"#4A6274","teal":"#2EC4B6","coral":"#E76F51",
      "lavender":"#9B8EC7","sky":"#48A9A6","sand":"#D4A373","steel":"#7F8C9B",
@@ -65,6 +68,11 @@ TT = {
     "cpi_shelter": "**Shelter CPI** — Consumer price index for housing costs (rent, owners' equivalent rent). YoY % change shows how fast housing costs are rising.",
     "forecast": "**Forecast Model** — Uses Ridge regression on lagged FRED indicators (unemployment, permits, CPI, GDP) to predict next-year values. Backtested with expanding-window walk-forward validation.",
     "opp_pred": "**Opportunity Prediction** — Ranks census tracts by projected investment potential. Combines current fundamentals (demand, affordability), momentum (ACS year-over-year changes), and macro forecast direction into a single forward-looking score.",
+    "fed_funds": "**Federal Funds Rate** — The interest rate at which banks lend reserves to each other overnight. Set by the Federal Reserve. Drives all other borrowing costs. Source: Federal Reserve via FRED.",
+    "mortgage_30y": "**30-Year Mortgage Rate** — Average rate on a 30-year fixed-rate mortgage. Directly impacts housing affordability and construction financing costs. Source: Freddie Mac via FRED.",
+    "treasury_10y": "**10-Year Treasury Yield** — Benchmark long-term rate. Cap rates, commercial loan pricing, and CMBS spreads all key off this. Source: Federal Reserve via FRED.",
+    "yield_curve": "**Yield Curve Spread (10Y–2Y)** — Difference between 10-year and 2-year Treasury yields. Negative = inverted curve, historically a recession leading indicator. Source: FRED.",
+    "rate_sensitivity": "**Rate Sensitivity Analysis** — Shows how ±100 basis point shifts in interest rates would affect forecast predictions, based on learned model coefficients.",
 }
 
 def tip(key):
@@ -197,7 +205,8 @@ def build_annual_dataset(fd):
         "GDP ($M)": "gdp",
         "Median Income ($)": "med_income",
     }
-    features_keys = ["unemp_philly","permits_tot","gdp","cpi_shelter","cpi_all","const_emp","homeown","med_income"]
+    features_keys = ["unemp_philly","permits_tot","gdp","cpi_shelter","cpi_all","const_emp","homeown","med_income",
+                      "fed_funds","treasury_10y","mortgage_30y","spread_10y2y"]
     frames = {}
     for key in features_keys:
         df = fd.get(key, pd.DataFrame())
@@ -546,6 +555,47 @@ with t_ov:
             fig.update_layout(**BL,title=dict(text="Philly MSA — CPI Year-over-Year (%)",font=dict(size=16)),yaxis_ticksuffix="%")
             st.plotly_chart(fig,use_container_width=True)
     with cc2: st.plotly_chart(lchart(fd.get("med_income",pd.DataFrame()),"Median HH Income — Philly County","Income",C["sky"],yp="$"),use_container_width=True)
+    # ── Rates & Credit Conditions ──
+    st.markdown('<div class="section-label">Rates & Credit Conditions</div>',unsafe_allow_html=True)
+    rc1,rc2,rc3,rc4=st.columns(4)
+    with rc1:
+        v,p=slat("fed_funds"); d=f"{v-p:+.2f}pp YoY" if v is not None and p is not None else None
+        st.metric("Fed Funds Rate",f"{v:.2f}%" if v else "—",d,delta_color="inverse",help=tip("fed_funds"))
+    with rc2:
+        v,p=slat("mortgage_30y"); d=f"{v-p:+.2f}pp YoY" if v is not None and p is not None else None
+        st.metric("30-Yr Mortgage",f"{v:.2f}%" if v else "—",d,delta_color="inverse",help=tip("mortgage_30y"))
+    with rc3:
+        v,p=slat("treasury_10y"); d=f"{v-p:+.2f}pp YoY" if v is not None and p is not None else None
+        st.metric("10-Yr Treasury",f"{v:.2f}%" if v else "—",d,delta_color="inverse",help=tip("treasury_10y"))
+    with rc4:
+        v,p=slat("spread_10y2y"); d=f"{v-p:+.2f}pp" if v is not None and p is not None else None
+        inv_warn = " ⚠️" if v is not None and v < 0 else ""
+        st.metric("Yield Curve (10Y–2Y)",f"{v:+.2f}%{inv_warn}" if v else "—",d,delta_color="normal",help=tip("yield_curve"))
+    rr1,rr2=st.columns(2)
+    with rr1:
+        ff=fd.get("fed_funds",pd.DataFrame()); mg=fd.get("mortgage_30y",pd.DataFrame())
+        if not ff.empty and not mg.empty:
+            fig=go.Figure()
+            fig.add_trace(go.Scatter(x=ff["date"],y=ff["value"],mode="lines",name="Fed Funds",line=dict(color=C["coral"],width=2.5)))
+            fig.add_trace(go.Scatter(x=mg["date"],y=mg["value"],mode="lines",name="30-Yr Mortgage",line=dict(color=C["gold"],width=2.5)))
+            t10=fd.get("treasury_10y",pd.DataFrame())
+            if not t10.empty:
+                fig.add_trace(go.Scatter(x=t10["date"],y=t10["value"],mode="lines",name="10-Yr Treasury",line=dict(color=C["teal"],width=2)))
+            fig.update_layout(**BL,title=dict(text="Interest Rates",font=dict(size=16)),yaxis_ticksuffix="%")
+            st.plotly_chart(fig,use_container_width=True)
+    with rr2:
+        sp=fd.get("spread_10y2y",pd.DataFrame())
+        if not sp.empty:
+            s=sp.sort_values("date").copy()
+            fig=go.Figure()
+            fig.add_trace(go.Scatter(x=s["date"],y=s["value"],mode="lines",line=dict(color=C["lavender"],width=2.5),
+                fill="tozeroy",fillcolor="rgba(155,142,199,0.08)",
+                hovertemplate="<b>%{x|%b %Y}</b><br>Spread: %{y:.2f}%<extra></extra>"))
+            fig.add_hline(y=0,line=dict(color=C["coral"],width=1.5,dash="dash"))
+            fig.add_annotation(x=s["date"].iloc[len(s)//2],y=-0.3,text="← Inverted (recession signal)",
+                font=dict(size=10,color=C["coral"]),showarrow=False)
+            fig.update_layout(**BL,title=dict(text="Yield Curve Spread (10Y–2Y)",font=dict(size=16)),yaxis_ticksuffix="%")
+            st.plotly_chart(fig,use_container_width=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 2: CONSTRUCTION
@@ -1017,6 +1067,145 @@ with t_fc:
 
 **Limitations:** Annual frequency limits sample size. Model assumes linear relationships and stable regime. Structural breaks (pandemics, policy shifts) may not be captured. GDP data lags ~1 year from BEA.
 """)
+
+        # ── RATE SENSITIVITY ANALYSIS ──
+        st.markdown('<div class="section-label">📈 Interest Rate Sensitivity</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="info-box">{tip("rate_sensitivity")}</div>', unsafe_allow_html=True)
+
+        # Re-run forecasts and perturb rate features
+        rate_features = ["fed_funds_lag1", "treasury_10y_lag1", "mortgage_30y_lag1"]
+        shock_bps = st.select_slider("Rate shock (basis points)", options=[-200, -100, -50, 0, 50, 100, 200], value=0, key="rate_shock")
+
+        if shock_bps != 0:
+            st.markdown(f"**Scenario:** All interest rates {'↑' if shock_bps > 0 else '↓'} {abs(shock_bps)}bp from current levels")
+
+        sens_rows = []
+        for target_label, target_key in targets.items():
+            if target_key not in annual.columns: continue
+            result = run_forecast(annual, target_key)
+            if result is None: continue
+            hr = result.get("horizon_results", {})
+            if 1 not in hr: continue
+            base_val = hr[1]["value"]
+
+            if shock_bps != 0 and result.get("importance") is not None:
+                # Compute shocked forecast by perturbing rate features
+                from sklearn.linear_model import Ridge
+                from sklearn.preprocessing import StandardScaler
+                clean = annual.ffill().bfill().dropna(axis=1)
+                if target_key not in clean.columns: continue
+                feature_cols = list(clean.columns)
+                lagged = clean.shift(1)
+                lagged.columns = [f"{c}_lag1" for c in feature_cols]
+                combo = pd.concat([clean[[target_key]], lagged], axis=1).iloc[1:]
+                combo = combo.replace([np.inf, -np.inf], np.nan).dropna()
+                if len(combo) < 6: continue
+                X = combo.drop(columns=[target_key])
+                y = combo[target_key]
+                feat_names = X.columns.tolist()
+                sc = StandardScaler(); X_s = sc.fit_transform(X)
+                m = Ridge(alpha=1.0); m.fit(X_s, y)
+                # Build prediction row with shocked rates
+                last_vals = clean[feature_cols].iloc[-1:].copy()
+                last_vals.columns = [f"{c}_lag1" for c in feature_cols]
+                last_vals = last_vals[feat_names].fillna(0)
+                shocked = last_vals.copy()
+                for rf in rate_features:
+                    if rf in shocked.columns:
+                        shocked[rf] = shocked[rf] + (shock_bps / 100.0)
+                shocked_val = m.predict(sc.transform(shocked))[0]
+                delta = shocked_val - base_val
+                delta_pct = (delta / abs(base_val)) * 100 if base_val != 0 else 0
+                sens_rows.append({
+                    "Metric": target_label, "Base Forecast": base_val,
+                    "Shocked Forecast": shocked_val, "Δ": delta, "Δ%": delta_pct,
+                })
+
+        if sens_rows and shock_bps != 0:
+            sens_df = pd.DataFrame(sens_rows)
+            sc1, sc2 = st.columns(2)
+            with sc1:
+                # Table
+                is_d = lambda l: "$" in l
+                is_p = lambda l: "%" in l
+                def fvs(v, lbl):
+                    if "$" in lbl and abs(v) >= 1e3: return f"${v/1e3:,.0f}K"
+                    if "$" in lbl: return f"${v:,.0f}"
+                    if "%" in lbl: return f"{v:.2f}%"
+                    return f"{v:,.0f}"
+                display_rows = []
+                for _, r in sens_df.iterrows():
+                    display_rows.append({
+                        "Metric": r["Metric"],
+                        "Base": fvs(r["Base Forecast"], r["Metric"]),
+                        f"{'↑' if shock_bps > 0 else '↓'}{abs(shock_bps)}bp": fvs(r["Shocked Forecast"], r["Metric"]),
+                        "Impact": f"{r['Δ%']:+.2f}%",
+                    })
+                st.dataframe(pd.DataFrame(display_rows), use_container_width=True, hide_index=True)
+            with sc2:
+                # Impact bar chart
+                fig = go.Figure(go.Bar(
+                    y=sens_df["Metric"].tolist()[::-1],
+                    x=sens_df["Δ%"].tolist()[::-1],
+                    orientation="h",
+                    marker_color=[C["teal"] if d > 0 else C["coral"] for d in sens_df["Δ%"].tolist()[::-1]],
+                    hovertemplate="<b>%{y}</b><br>Impact: %{x:+.2f}%<extra></extra>"))
+                fig.add_vline(x=0, line=dict(color=C["muted"], width=1))
+                fig.update_layout(**BL, title=dict(text=f"Rate {'Hike' if shock_bps > 0 else 'Cut'} Impact on 1-Year Forecasts", font=dict(size=14)),
+                    xaxis_ticksuffix="%", xaxis_title="Change from Base (%)")
+                st.plotly_chart(fig, use_container_width=True)
+        elif shock_bps == 0:
+            st.markdown("_Move the slider above to simulate a rate shock scenario._")
+
+        # ── PREDICTION TRACKER ──
+        st.markdown('<div class="section-label">📋 Prediction Tracker</div>', unsafe_allow_html=True)
+        st.markdown('<div class="info-box">**Prediction Log** — Captures today\'s forecasts for future validation. As actuals become available, accuracy can be measured. Export this table periodically to build a track record.</div>', unsafe_allow_html=True)
+
+        tracker_rows = []
+        for target_label, target_key in targets.items():
+            if target_key not in annual.columns: continue
+            result = run_forecast(annual, target_key)
+            if result is None: continue
+            hr = result.get("horizon_results", {})
+            for h in [1, 2, 5]:
+                if h not in hr: continue
+                tracker_rows.append({
+                    "Metric": target_label,
+                    "Horizon": f"{h}-Year",
+                    "Target Year": hr[h]["year"],
+                    "Forecast": hr[h]["value"],
+                    "95% CI Low": hr[h]["ci_low"],
+                    "95% CI High": hr[h]["ci_high"],
+                    "Base Year Actual": result["last_actual_val"],
+                    "Backtest MAPE": result["mape"],
+                    "Generated": datetime.now().strftime("%Y-%m-%d"),
+                })
+        if tracker_rows:
+            trk = pd.DataFrame(tracker_rows)
+            # Format for display
+            def fmt_trk(row):
+                lbl = row["Metric"]
+                def f(v):
+                    if "$" in lbl and abs(v) >= 1e3: return f"${v/1e3:,.1f}K"
+                    if "$" in lbl: return f"${v:,.0f}"
+                    if "%" in lbl: return f"{v:.2f}%"
+                    return f"{v:,.0f}"
+                return pd.Series({
+                    "Metric": lbl, "Horizon": row["Horizon"], "Target Year": int(row["Target Year"]),
+                    "Forecast": f(row["Forecast"]),
+                    "95% CI": f"{f(row['95% CI Low'])} – {f(row['95% CI High'])}",
+                    "Last Actual": f(row["Base Year Actual"]),
+                    "MAPE": f"{row['Backtest MAPE']:.1f}%",
+                    "Date": row["Generated"],
+                })
+            trk_display = trk.apply(fmt_trk, axis=1)
+            st.dataframe(trk_display, use_container_width=True, hide_index=True)
+
+            # CSV download
+            csv_data = trk.to_csv(index=False)
+            st.download_button("📥 Export Predictions (CSV)", csv_data,
+                f"lapstone_predictions_{datetime.now().strftime('%Y%m%d')}.csv",
+                "text/csv", key="pred_dl")
 
         # ── OPPORTUNITY AREA PREDICTION ──
         st.markdown('<div class="section-label">🎯 Opportunity Area Prediction</div>', unsafe_allow_html=True)
