@@ -353,17 +353,26 @@ def fetch_acs_tracts_year(variables, state="42", county="101", year=2023):
     """Fetch tract data for a specific ACS year."""
     return fetch_acs_tracts(variables, state, county, year)
 
-def compute_tract_opportunity(tracts_current, tracts_prior, macro_forecasts):
+def compute_tract_opportunity(tracts_current, tracts_prior, macro_forecasts, horizon=1):
     """
     Score each tract on forward-looking investment potential.
     Components:
       1. Fundamentals (40%): demand score, renter %, young adults
       2. Momentum (30%): YoY improvement in rent, income, young adult share
+         - Decays for longer horizons (momentum is less predictive further out)
       3. Affordability Headroom (20%): low rent-to-income = room for rent growth
-      4. Macro Alignment (10%): tracts that benefit from forecasted macro direction
+      4. Macro Alignment (10% short-term, 15% long-term): macro forecast direction
     """
     curr = tracts_current.copy()
     if curr.empty: return pd.DataFrame()
+
+    # Adjust weights by horizon — momentum matters less at 5yr, macro matters more
+    if horizon <= 1:
+        w_fund, w_mom, w_head, w_macro = 0.40, 0.30, 0.20, 0.10
+    elif horizon <= 2:
+        w_fund, w_mom, w_head, w_macro = 0.40, 0.25, 0.22, 0.13
+    else:
+        w_fund, w_mom, w_head, w_macro = 0.42, 0.18, 0.25, 0.15
 
     # -- Fundamentals (reuse demand score) --
     scored = compute_demand_score(curr)
@@ -379,15 +388,11 @@ def compute_tract_opportunity(tracts_current, tracts_prior, macro_forecasts):
                       "B19013_001E": "income_prev", "renter_pct": "renter_prev"}
         pm = prior[list(prior_cols.keys())].rename(columns=prior_cols)
         scored = scored.merge(pm, on="GEOID", how="left")
-        # Rent growth (positive = rents rising = good for landlords)
         scored["rent_growth"] = ((scored["B25064_001E"] - scored["rent_prev"]) / scored["rent_prev"].clip(lower=1)) * 100
-        # Income growth (positive = tenants can afford more)
         scored["income_growth"] = ((scored["B19013_001E"] - scored["income_prev"]) / scored["income_prev"].clip(lower=1)) * 100
-        # Young adult growth
         scored["youth_growth"] = scored["pct2534"] - scored["pct2534_prev"]
-        # Normalize momentum signals
         for mc in ["rent_growth", "income_growth", "youth_growth"]:
-            scored[mc] = scored[mc].clip(-50, 50)  # cap outliers
+            scored[mc] = scored[mc].clip(-50, 50)
             mn, mx = scored[mc].min(), scored[mc].max()
             scored[f"{mc}_n"] = (scored[mc] - mn) / (mx - mn + 0.01)
         scored["momentum"] = (scored["rent_growth_n"] * 0.4 + scored["income_growth_n"] * 0.35 + scored["youth_growth_n"] * 0.25)
@@ -397,30 +402,27 @@ def compute_tract_opportunity(tracts_current, tracts_prior, macro_forecasts):
         scored["income_growth"] = np.nan
         scored["youth_growth"] = np.nan
 
-    # -- Affordability Headroom: low r2i = room to raise rents --
+    # -- Affordability Headroom --
     scored["headroom"] = 1 - (scored["r2i"].clip(0, 60) / 60)
     hr_min, hr_max = scored["headroom"].min(), scored["headroom"].max()
     scored["headroom_n"] = (scored["headroom"] - hr_min) / (hr_max - hr_min + 0.01)
 
-    # -- Macro Alignment --
-    macro_boost = 0.5  # neutral default
+    # -- Macro Alignment (horizon-specific) --
+    macro_boost = 0.5
     if macro_forecasts:
         signals = []
-        # If permits forecast up → construction/supply signal
         if "Permits (Annual)" in macro_forecasts:
             pf = macro_forecasts["Permits (Annual)"]
             if pf and pf.get("forecast_val", 0) > pf.get("last_actual_val", 0):
                 signals.append(0.6)
             else:
                 signals.append(0.4)
-        # If GDP forecast up → demand signal
         if "GDP ($M)" in macro_forecasts:
             gf = macro_forecasts["GDP ($M)"]
             if gf and gf.get("forecast_val", 0) > gf.get("last_actual_val", 0):
                 signals.append(0.7)
             else:
                 signals.append(0.3)
-        # If unemployment forecast down → demand signal
         if "Unemployment (%)" in macro_forecasts:
             uf = macro_forecasts["Unemployment (%)"]
             if uf and uf.get("forecast_val", 0) < uf.get("last_actual_val", 0):
@@ -433,10 +435,10 @@ def compute_tract_opportunity(tracts_current, tracts_prior, macro_forecasts):
 
     # -- Composite Score --
     scored["opp_pred"] = (
-        scored["fund_n"] * 0.40 +
-        scored["momentum"] * 0.30 +
-        scored["headroom_n"] * 0.20 +
-        scored["macro_n"] * 0.10
+        scored["fund_n"] * w_fund +
+        scored["momentum"] * w_mom +
+        scored["headroom_n"] * w_head +
+        scored["macro_n"] * w_macro
     ) * 100
 
     return scored
@@ -1212,16 +1214,19 @@ with t_fc:
         st.markdown(f'<div class="info-box">{tip("opp_pred")}</div>', unsafe_allow_html=True)
 
         if CENSUS_API_KEY:
-            # Collect macro forecast results for alignment signal
-            macro_results = {}
-            for tl, tk in targets.items():
-                if tk in annual.columns:
-                    r = run_forecast(annual, tk)
-                    if r and r.get("horizon_results") and 1 in r["horizon_results"]:
-                        macro_results[tl] = {
-                            "forecast_val": r["horizon_results"][1]["value"],
-                            "last_actual_val": r["last_actual_val"],
-                        }
+            # Collect macro forecast results for all horizons
+            macro_by_horizon = {}
+            for h in [1, 2, 5]:
+                macro_h = {}
+                for tl, tk in targets.items():
+                    if tk in annual.columns:
+                        r = run_forecast(annual, tk)
+                        if r and r.get("horizon_results") and h in r["horizon_results"]:
+                            macro_h[tl] = {
+                                "forecast_val": r["horizon_results"][h]["value"],
+                                "last_actual_val": r["last_actual_val"],
+                            }
+                macro_by_horizon[h] = macro_h
 
             opp_counties = st.multiselect("Counties to score", [k for k,v in COUNTY_FIPS.items() if v[0]=="42"],
                 default=["Philadelphia"], key="opp_mc")
@@ -1236,21 +1241,72 @@ with t_fc:
                     tracts_curr = compute_tract_metrics(tracts_curr)
                     tracts_curr["GEOID"] = tracts_curr["state"] + tracts_curr["county"] + tracts_curr["tract"]
 
-                    opp = compute_tract_opportunity(tracts_curr, tracts_prev, macro_results)
+                    # Compute opportunity scores for all horizons
+                    opp_horizons = {}
+                    for h in [1, 2, 5]:
+                        opp_h = compute_tract_opportunity(tracts_curr, tracts_prev, macro_by_horizon.get(h, {}), horizon=h)
+                        if not opp_h.empty:
+                            opp_h = opp_h.rename(columns={"opp_pred": f"opp_{h}yr"})
+                            opp_horizons[h] = opp_h
 
-                    if not opp.empty:
+                    if opp_horizons:
+                        # Merge all horizons into one dataframe
+                        opp = opp_horizons[1].copy() if 1 in opp_horizons else list(opp_horizons.values())[0].copy()
+                        for h in [2, 5]:
+                            if h in opp_horizons and f"opp_{h}yr" in opp_horizons[h].columns:
+                                opp[f"opp_{h}yr"] = opp_horizons[h][f"opp_{h}yr"].values
+                        # Default display column
+                        if "opp_1yr" not in opp.columns and "opp_2yr" in opp.columns:
+                            opp["opp_1yr"] = opp["opp_2yr"]
+
+                        # Horizon selector
+                        opp_horizon_sel = st.radio("Forecast horizon", ["1-Year", "2-Year", "5-Year"],
+                            horizontal=True, key="opp_hz")
+                        hz_map = {"1-Year": 1, "2-Year": 2, "5-Year": 5}
+                        sel_h = hz_map[opp_horizon_sel]
+                        score_col = f"opp_{sel_h}yr"
+                        if score_col not in opp.columns:
+                            score_col = "opp_1yr"
+
                         top_n = st.slider("Top tracts to display", 10, 50, 25, key="opp_n")
-                        top = opp.nlargest(top_n, "opp_pred").copy()
+                        top = opp.nlargest(top_n, score_col).copy()
                         top["lbl"] = top["NAME"].str.replace(r"Census Tract (\d+\.?\d*),.*", r"Tract \1", regex=True)
 
                         # Summary metrics
-                        om1, om2, om3, om4 = st.columns(4)
-                        with om1: st.metric("Top Score", f"{top['opp_pred'].max():.1f}/100")
-                        with om2: st.metric("Median Score (Top)", f"{top['opp_pred'].median():.1f}/100")
+                        om1, om2, om3, om4, om5 = st.columns(5)
+                        with om1: st.metric(f"Top Score ({opp_horizon_sel})", f"{top[score_col].max():.1f}/100")
+                        with om2: st.metric("Median (Top)", f"{top[score_col].median():.1f}/100")
                         with om3: st.metric(f"Tracts Scored", f"{len(opp):,}")
                         with om4:
-                            macro_dir = "📈 Favorable" if np.mean([r.get("forecast_val",0) > r.get("last_actual_val",0) for r in macro_results.values() if r]) > 0.5 else "📉 Cautious"
+                            macro_vals = macro_by_horizon.get(sel_h, {})
+                            macro_dir = "📈 Favorable" if macro_vals and np.mean([r.get("forecast_val",0) > r.get("last_actual_val",0) for r in macro_vals.values() if r]) > 0.5 else "📉 Cautious"
                             st.metric("Macro Outlook", macro_dir)
+                        with om5:
+                            # Show how rankings shift across horizons
+                            if "opp_1yr" in opp.columns and "opp_5yr" in opp.columns:
+                                top1 = set(opp.nlargest(10, "opp_1yr")["GEOID"])
+                                top5 = set(opp.nlargest(10, "opp_5yr")["GEOID"])
+                                overlap = len(top1 & top5)
+                                st.metric("1yr↔5yr Overlap", f"{overlap}/10",
+                                    help="How many of the top 10 tracts at the 1-year horizon remain in the top 10 at 5 years. Low overlap = rankings shift significantly over time.")
+
+                        # Horizon comparison for top tracts
+                        if all(f"opp_{h}yr" in opp.columns for h in [1, 2, 5]):
+                            with st.expander("📊 Horizon Comparison — How Scores Shift Over Time"):
+                                top_compare = opp.nlargest(15, score_col).copy()
+                                top_compare["lbl"] = top_compare["NAME"].str.replace(r"Census Tract (\d+\.?\d*),.*", r"Tract \1", regex=True)
+                                fig = go.Figure()
+                                for h, clr in [(1, C["teal"]), (2, C["gold"]), (5, C["coral"])]:
+                                    fig.add_trace(go.Bar(
+                                        y=top_compare["lbl"].tolist()[::-1],
+                                        x=top_compare[f"opp_{h}yr"].tolist()[::-1],
+                                        name=f"{h}-Year", orientation="h",
+                                        marker_color=clr, opacity=0.8))
+                                fig.update_layout(**BL, barmode="group",
+                                    title=dict(text="Top 15 Tracts — Score by Horizon", font=dict(size=14)),
+                                    xaxis_title="Opportunity Score", height=max(400, 15 * 28),
+                                    legend=dict(orientation="h", y=1.05, bgcolor="rgba(0,0,0,0)"))
+                                st.plotly_chart(fig, use_container_width=True)
 
                         # Map
                         geo = load_geojson("42")
@@ -1260,7 +1316,7 @@ with t_fc:
                                 f for f in geo["features"] if f["properties"]["STATEFP"]+f["properties"]["COUNTYFP"] in cfset]}
                             zoom = 10.5 if len(opp_counties) == 1 else (9.5 if len(opp_counties) <= 3 else 8.5)
                             fig = go.Figure(go.Choroplethmapbox(
-                                geojson=fgeo, locations=opp["GEOID"], z=opp["opp_pred"],
+                                geojson=fgeo, locations=opp["GEOID"], z=opp[score_col],
                                 featureidkey="properties.GEOID", text=opp["NAME"],
                                 colorscale=[[0, C["slate"]], [0.4, C["teal"]], [0.7, C["gold"]], [1, C["coral"]]],
                                 marker_opacity=0.8, marker_line_width=0.5,
@@ -1272,36 +1328,45 @@ with t_fc:
                                 mapbox=dict(style="carto-darkmatter", center=dict(lat=39.99, lon=-75.16), zoom=zoom),
                                 paper_bgcolor="rgba(0,0,0,0)", font=dict(color=C["text"], family="DM Sans"),
                                 margin=dict(l=0, r=0, t=50, b=0),
-                                title=dict(text="Opportunity Area Prediction — Next Year", font=dict(size=16, color=C["text"])), height=620)
+                                title=dict(text=f"Opportunity Area Prediction — {opp_horizon_sel}", font=dict(size=16, color=C["text"])), height=620)
                             st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True, "displayModeBar": True})
 
                         # Bar chart: top tracts
                         fig = go.Figure(go.Bar(
-                            y=top["lbl"].tolist()[::-1], x=top["opp_pred"].tolist()[::-1],
+                            y=top["lbl"].tolist()[::-1], x=top[score_col].tolist()[::-1],
                             orientation="h",
-                            marker=dict(color=top["opp_pred"].tolist()[::-1],
+                            marker=dict(color=top[score_col].tolist()[::-1],
                                 colorscale=[[0, C["teal"]], [1, C["gold"]]]),
                             hovertemplate="<b>%{y}</b><br>Score: %{x:.1f}/100<extra></extra>"))
-                        fig.update_layout(**BL, title=dict(text=f"Top {top_n} Opportunity Tracts", font=dict(size=16)),
+                        fig.update_layout(**BL, title=dict(text=f"Top {top_n} Opportunity Tracts ({opp_horizon_sel})", font=dict(size=16)),
                             xaxis_title="Opportunity Score", height=max(400, top_n * 22))
                         st.plotly_chart(fig, use_container_width=True)
 
                         # Detailed table
-                        with st.expander(f"📋 Top {top_n} Tracts — Full Breakdown"):
-                            show_cols = ["lbl", "opp_pred", "score", "B25064_001E", "B19013_001E",
+                        with st.expander(f"📋 Top {top_n} Tracts — Full Breakdown ({opp_horizon_sel})"):
+                            show_cols = ["lbl", score_col, "score", "B25064_001E", "B19013_001E",
                                          "r2i", "pct2534", "renter_pct"]
-                            rename = {"lbl": "Tract", "opp_pred": "Opp Score", "score": "Demand Score",
+                            rename = {"lbl": "Tract", score_col: f"Opp Score ({opp_horizon_sel})", "score": "Demand Score",
                                       "B25064_001E": "Rent", "B19013_001E": "Income",
                                       "r2i": "Rent/Inc %", "pct2534": "% 25-34", "renter_pct": "% Renters"}
+                            # Add all horizon scores to table
+                            for h in [1, 2, 5]:
+                                hcol = f"opp_{h}yr"
+                                if hcol in top.columns and hcol != score_col:
+                                    show_cols.append(hcol)
+                                    rename[hcol] = f"{h}yr Score"
                             extra_cols = {}
                             if "rent_growth" in top.columns:
                                 show_cols.extend(["rent_growth", "income_growth", "youth_growth"])
                                 extra_cols = {"rent_growth": "Rent Δ%", "income_growth": "Income Δ%", "youth_growth": "Youth Δpp"}
                             rename.update(extra_cols)
                             tbl = top[[c for c in show_cols if c in top.columns]].rename(columns=rename)
-                            fmt = {"Opp Score": "{:.1f}", "Demand Score": "{:.0f}", "Rent": "${:,.0f}",
+                            fmt = {f"Opp Score ({opp_horizon_sel})": "{:.1f}", "Demand Score": "{:.0f}", "Rent": "${:,.0f}",
                                    "Income": "${:,.0f}", "Rent/Inc %": "{:.1f}%", "% 25-34": "{:.1f}%",
                                    "% Renters": "{:.1f}%"}
+                            for h in [1, 2, 5]:
+                                if f"{h}yr Score" in tbl.columns:
+                                    fmt[f"{h}yr Score"] = "{:.1f}"
                             if "Rent Δ%" in tbl.columns:
                                 fmt.update({"Rent Δ%": "{:+.1f}%", "Income Δ%": "{:+.1f}%", "Youth Δpp": "{:+.1f}pp"})
                             st.dataframe(tbl.style.format({k: v for k, v in fmt.items() if k in tbl.columns}),
