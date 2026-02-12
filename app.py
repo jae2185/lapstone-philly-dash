@@ -547,7 +547,7 @@ with t_reg:
             }).sort_values("Population",ascending=False)
             st.dataframe(disp.style.format({"Population":"{:,.0f}","Med Income":"${:,.0f}","Med Rent":"${:,.0f}",
                 "% 25-34":"{:.1f}%","% Renters":"{:.1f}%","Rent/Inc %":"{:.1f}%","Unemp %":"{:.1f}%"
-            }).background_gradient(cmap="YlOrRd",subset=["% 25-34","% Renters"]),use_container_width=True,hide_index=True)
+            }),use_container_width=True,hide_index=True)
             # Opportunity Score
             st.markdown('<div class="section-label">Blue-Collar Rental Opportunity Score</div>',unsafe_allow_html=True)
             st.markdown('<div class="info-box">Composite: Young adults (25%) + Renter prevalence (25%) + Affordability (25%) + Employment (25%).</div>',unsafe_allow_html=True)
