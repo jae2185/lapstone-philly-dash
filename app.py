@@ -167,15 +167,16 @@ def bchart(names,vals,title,color=C["gold"],horiz=False,yl="",yp=""):
     fig.update_layout(**BL,title=dict(text=title,font=dict(size=16))); return fig
 
 def compute_tract_metrics(df):
+    df = df.copy()
     for col in TRACT_VARS:
         df[col]=pd.to_numeric(df[col],errors="coerce")
         df.loc[df[col]<=-666666666,col]=np.nan
     df["pop2534"]=df[["B01001_011E","B01001_012E","B01001_035E","B01001_036E"]].sum(axis=1)
-    df["pct2534"]=df["pop2534"]/df["B01003_001E"]*100
-    df["renter_pct"]=df["B25003_003E"]/df["B25003_001E"]*100
-    df["burden_pct"]=df[["B25070_008E","B25070_009E","B25070_010E","B25070_011E"]].sum(axis=1)/df["B25070_001E"]*100
-    df["r2i"]=(df["B25064_001E"]*12)/df["B19013_001E"]*100
-    df["unemp"]=df["B23025_005E"]/df["B23025_002E"]*100
+    df["pct2534"]=df["pop2534"]/df["B01003_001E"].replace(0,np.nan)*100
+    df["renter_pct"]=df["B25003_003E"]/df["B25003_001E"].replace(0,np.nan)*100
+    df["burden_pct"]=df[["B25070_008E","B25070_009E","B25070_010E","B25070_011E"]].sum(axis=1)/df["B25070_001E"].replace(0,np.nan)*100
+    df["r2i"]=(df["B25064_001E"]*12)/df["B19013_001E"].replace(0,np.nan)*100
+    df["unemp"]=df["B23025_005E"]/df["B23025_002E"].replace(0,np.nan)*100
     return df
 
 def compute_demand_score(df):
@@ -209,6 +210,9 @@ def build_annual_dataset(fd):
         frames[key] = agg
     if not frames: return pd.DataFrame(), targets
     annual = pd.concat(frames.values(), axis=1).dropna(how="all")
+    # Exclude current incomplete year to avoid partial-year bias
+    current_year = datetime.now().year
+    annual = annual[annual.index < current_year]
     return annual, targets
 
 def run_forecast(annual, target_col, n_backtest=5, horizons=(1, 2, 5)):
