@@ -209,6 +209,10 @@ def build_annual_dataset(fd):
         frames[key] = agg
     if not frames: return pd.DataFrame(), targets
     annual = pd.concat(frames.values(), axis=1).dropna(how="all")
+    # Exclude current incomplete year to avoid partial-year bias
+    from datetime import datetime
+    current_year = datetime.now().year
+    annual = annual[annual.index < current_year]
     return annual, targets
 
 def run_forecast(annual, target_col, n_backtest=5):
