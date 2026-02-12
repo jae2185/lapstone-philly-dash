@@ -24,7 +24,7 @@ COUNTY_FIPS = {
 }
 FRED_SERIES = {
     "unemp_philly":"PAPHIL5URN","pop_philly":"PAPHIL5POP",
-    "labor_force":"LAUCN421010000000006","med_income":"MHIPA42101A052NCEN",
+    "labor_force":"PAPHIL5LFN","med_income":"MHIPA42101A052NCEN",
     "homeown":"HOWNRATEACS042101","unemp_msa":"PHIL942URN",
     "const_emp":"SMU42979611500000001SA","nonfarm":"SMU42379800000000001SA",
     "permits_tot":"PHIL942BPPRIV","permits_1u":"PHIL942BP1FH",
