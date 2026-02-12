@@ -886,20 +886,42 @@ with t_fc:
                 # Charts
                 bt = result["backtest"]
                 fc_df = result["forecasts"]
+
+                # Build full actual history from annual dataset
+                full_actual = annual[[target_key]].dropna().copy()
+                full_actual = full_actual.reset_index()
+                full_actual.columns = ["year", "actual"]
+
                 ch1, ch2 = st.columns(2)
                 with ch1:
                     fig = go.Figure()
-                    # Actuals from backtest
-                    fig.add_trace(go.Scatter(x=bt["year"], y=bt["actual"], mode="lines+markers",
-                        name="Actual", line=dict(color=C["teal"], width=2.5), marker=dict(size=6)))
-                    fig.add_trace(go.Scatter(x=bt["year"], y=bt["predicted"], mode="lines+markers",
-                        name="Backtest Pred", line=dict(color=C["gold"], width=2, dash="dash"), marker=dict(size=6, symbol="diamond")))
-                    # Forecast line with CI band
-                    fig.add_trace(go.Scatter(x=fc_df["year"], y=fc_df["ci_high"],
+                    # Full actual history line
+                    fig.add_trace(go.Scatter(x=full_actual["year"], y=full_actual["actual"],
+                        mode="lines+markers", name="Actual",
+                        line=dict(color=C["teal"], width=2.5), marker=dict(size=5),
+                        hovertemplate="<b>%{x}</b><br>Actual: " + ("$" if is_dollar else "") + "%{y:,.1f}" + ("%" if is_pct else "") + "<extra></extra>"))
+                    # Backtest predictions overlay
+                    if not bt.empty:
+                        fig.add_trace(go.Scatter(x=bt["year"], y=bt["predicted"], mode="markers",
+                            name="Backtest Pred", marker=dict(color=C["gold"], size=7, symbol="diamond", opacity=0.8),
+                            hovertemplate="<b>%{x}</b><br>Backtest: " + ("$" if is_dollar else "") + "%{y:,.1f}" + ("%" if is_pct else "") + "<extra></extra>"))
+                    # Bridge: connect last actual to first forecast
+                    last_yr = result["last_actual_year"]
+                    last_val = result["last_actual_val"]
+                    bridge_x = [last_yr, fc_df["year"].iloc[0]]
+                    bridge_y = [last_val, fc_df["value"].iloc[0]]
+                    fig.add_trace(go.Scatter(x=bridge_x, y=bridge_y, mode="lines",
+                        line=dict(color=C["coral"], width=1.5, dash="dot"), showlegend=False, hoverinfo="skip"))
+                    # Forecast CI band
+                    ci_x = [last_yr] + fc_df["year"].tolist()
+                    ci_hi = [last_val] + fc_df["ci_high"].tolist()
+                    ci_lo = [last_val] + fc_df["ci_low"].tolist()
+                    fig.add_trace(go.Scatter(x=ci_x, y=ci_hi,
                         mode="lines", line=dict(width=0), showlegend=False, hoverinfo="skip"))
-                    fig.add_trace(go.Scatter(x=fc_df["year"], y=fc_df["ci_low"],
+                    fig.add_trace(go.Scatter(x=ci_x, y=ci_lo,
                         mode="lines", line=dict(width=0), fill="tonexty",
-                        fillcolor="rgba(231,111,81,0.12)", showlegend=False, hoverinfo="skip"))
+                        fillcolor="rgba(231,111,81,0.10)", showlegend=False, hoverinfo="skip"))
+                    # Forecast line
                     fig.add_trace(go.Scatter(x=fc_df["year"], y=fc_df["value"], mode="lines+markers",
                         name="Forecast", line=dict(color=C["coral"], width=2.5),
                         marker=dict(size=8, symbol="star"),
@@ -913,7 +935,7 @@ with t_fc:
                     fmt = {}
                     if is_dollar: fmt["yaxis_tickprefix"] = "$"
                     if is_pct: fmt["yaxis_ticksuffix"] = "%"
-                    fig.update_layout(**BL, title=dict(text=f"{target_label} — Backtest + Multi-Year Forecast", font=dict(size=14)), **fmt)
+                    fig.update_layout(**BL, title=dict(text=f"{target_label} — History + Forecast", font=dict(size=14)), **fmt)
                     st.plotly_chart(fig, use_container_width=True)
 
                 with ch2:
