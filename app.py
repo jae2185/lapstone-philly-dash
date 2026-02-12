@@ -212,7 +212,7 @@ def build_annual_dataset(fd):
     return annual, targets
 
 def run_forecast(annual, target_col, n_backtest=5, horizons=(1, 2, 5)):
-    """Walk-forward Ridge regression with multi-year iterative forecasting."""
+    """Walk-forward Ridge regression with multi-horizon iterative forecasting and backtesting."""
     from sklearn.linear_model import Ridge
     from sklearn.preprocessing import StandardScaler
     if target_col not in annual.columns or len(annual) < 8:
@@ -229,51 +229,93 @@ def run_forecast(annual, target_col, n_backtest=5, horizons=(1, 2, 5)):
     X = combo.drop(columns=[target_col])
     y = combo[target_col]
     feat_names = X.columns.tolist()
-    # Walk-forward backtest
-    bt_results = []
-    min_train = max(5, len(combo) - n_backtest - 1)
+
+    # ── Multi-horizon walk-forward backtest ──
+    # For each split point, train model, then iteratively predict 1, 2, ... max(horizons) years ahead
+    max_h = max(horizons)
+    bt_all = []  # rows: {year_origin, horizon, predicted, actual}
+    min_train = max(5, len(combo) - n_backtest - max_h)
     for split in range(min_train, len(combo) - 1):
         X_tr, y_tr = X.iloc[:split], y.iloc[:split]
-        X_te, y_te = X.iloc[split:split+1], y.iloc[split:split+1]
-        sc = StandardScaler(); X_tr_s = sc.fit_transform(X_tr); X_te_s = sc.transform(X_te)
-        m = Ridge(alpha=1.0); m.fit(X_tr_s, y_tr)
-        pred = m.predict(X_te_s)[0]
-        bt_results.append({"year": y_te.index[0], "actual": y_te.values[0], "predicted": pred})
-    bt = pd.DataFrame(bt_results)
-    if bt.empty: return None
-    bt["error"] = bt["predicted"] - bt["actual"]
-    bt["abs_pct_error"] = (bt["error"].abs() / bt["actual"].abs().clip(lower=0.01)) * 100
-    mape = bt["abs_pct_error"].mean()
-    rmse = np.sqrt((bt["error"]**2).mean())
-    std_err = bt["error"].std() if len(bt) > 1 else abs(y.iloc[-1]) * 0.05
+        sc_bt = StandardScaler(); X_tr_s = sc_bt.fit_transform(X_tr)
+        m_bt = Ridge(alpha=1.0); m_bt.fit(X_tr_s, y_tr)
+        # Iterative multi-step prediction from this split
+        sim_row = clean[feature_cols].iloc[split - 1 + 1:split + 1].copy()  # row at split index in clean
+        if sim_row.empty: continue
+        sim_row = sim_row.iloc[-1:].copy()
+        for h in range(1, max_h + 1):
+            future_idx = split + h - 1  # index into combo
+            if future_idx >= len(combo): break
+            inp = sim_row.copy()
+            inp.columns = [f"{c}_lag1" for c in feature_cols]
+            inp = inp[feat_names].fillna(0)
+            pred_h = m_bt.predict(sc_bt.transform(inp))[0]
+            actual_h = y.iloc[future_idx] if future_idx < len(y) else None
+            if actual_h is not None:
+                bt_all.append({
+                    "year_origin": y.index[split - 1] if split > 0 else y.index[0],
+                    "year_target": y.index[future_idx],
+                    "horizon": h, "predicted": pred_h, "actual": actual_h,
+                })
+            # Feed prediction back
+            sim_row = sim_row.copy()
+            if target_col in sim_row.columns:
+                sim_row[target_col] = pred_h
+
+    bt_full = pd.DataFrame(bt_all)
+    if bt_full.empty: return None
+
+    bt_full["error"] = bt_full["predicted"] - bt_full["actual"]
+    bt_full["abs_pct_error"] = (bt_full["error"].abs() / bt_full["actual"].abs().clip(lower=0.01)) * 100
+
+    # Per-horizon accuracy
+    horizon_accuracy = {}
+    for h in horizons:
+        bh = bt_full[bt_full["horizon"] == h]
+        if not bh.empty:
+            horizon_accuracy[h] = {
+                "mape": bh["abs_pct_error"].mean(),
+                "rmse": np.sqrt((bh["error"] ** 2).mean()),
+                "n": len(bh),
+            }
+
+    # 1-year backtest for display (backward compat)
+    bt1 = bt_full[bt_full["horizon"] == 1].copy()
+    bt1 = bt1.rename(columns={"year_target": "year"})
+    mape = bt1["abs_pct_error"].mean() if not bt1.empty else 0
+    rmse = np.sqrt((bt1["error"] ** 2).mean()) if not bt1.empty else 0
+    std_err = bt1["error"].std() if len(bt1) > 1 else abs(y.iloc[-1]) * 0.05
+
     # Train final model on all data
     sc = StandardScaler(); X_s = sc.fit_transform(X); m = Ridge(alpha=1.0); m.fit(X_s, y)
     coefs = pd.Series(m.coef_, index=feat_names).abs().sort_values(ascending=False)
+
     # Multi-horizon iterative forecast
-    # Feed each prediction back as "last known" to predict the next year
-    last_known = clean[feature_cols].iloc[-1:].copy()  # most recent actual values
+    last_known = clean[feature_cols].iloc[-1:].copy()
     base_year = int(clean.index[-1])
-    forecasts = []  # list of {year, value, ci_low, ci_high}
+    forecasts = []
     simulated_row = last_known.copy()
-    for h in range(1, max(horizons) + 1):
+    for h in range(1, max_h + 1):
         inp = simulated_row.copy()
         inp.columns = [f"{c}_lag1" for c in feature_cols]
         inp = inp[feat_names].fillna(0)
         pred = m.predict(sc.transform(inp))[0]
-        # CI widens with sqrt(horizon) — uncertainty compounds
         ci_mult = 1.96 * np.sqrt(h)
+        # Use horizon-specific std_err if available
+        h_err = std_err
+        if h in horizon_accuracy and horizon_accuracy[h]["n"] > 1:
+            bh = bt_full[bt_full["horizon"] == h]
+            h_err = bh["error"].std()
         forecasts.append({
             "year": base_year + h, "value": pred,
-            "ci_low": pred - ci_mult * std_err,
-            "ci_high": pred + ci_mult * std_err,
+            "ci_low": pred - 1.96 * h_err, "ci_high": pred + 1.96 * h_err,
             "horizon": h,
         })
-        # Update simulated row: replace target col with prediction, keep others trending
         simulated_row = simulated_row.copy()
         if target_col in simulated_row.columns:
             simulated_row[target_col] = pred
+
     fc_df = pd.DataFrame(forecasts)
-    # Extract specific horizon results
     horizon_results = {}
     for h in horizons:
         row = fc_df[fc_df["horizon"] == h]
@@ -284,7 +326,9 @@ def run_forecast(annual, target_col, n_backtest=5, horizons=(1, 2, 5)):
                 "ci_low": r["ci_low"], "ci_high": r["ci_high"],
             }
     return {
-        "backtest": bt, "mape": mape, "rmse": rmse,
+        "backtest": bt1, "backtest_full": bt_full,
+        "horizon_accuracy": horizon_accuracy,
+        "mape": mape, "rmse": rmse,
         "forecasts": fc_df, "horizon_results": horizon_results,
         "last_actual_year": base_year, "last_actual_val": y.iloc[-1],
         "importance": coefs, "n_train": len(combo), "std_err": std_err,
@@ -880,6 +924,55 @@ with t_fc:
                         hovertemplate="<b>%{y}</b><br>Importance: %{x:.3f}<extra></extra>"))
                     fig.update_layout(**BL, title=dict(text="Feature Importance (Abs Coefficients)", font=dict(size=14)))
                     st.plotly_chart(fig, use_container_width=True)
+
+                # Multi-horizon backtest accuracy
+                ha = result.get("horizon_accuracy", {})
+                if ha:
+                    bt_cols = st.columns(len(ha))
+                    for i, (h, acc) in enumerate(sorted(ha.items())):
+                        with bt_cols[i]:
+                            label = f"{h}-Year" if h > 1 else "1-Year"
+                            color = "normal" if acc["mape"] < 15 else ("off" if acc["mape"] < 30 else "inverse")
+                            st.metric(f"{label} MAPE", f"{acc['mape']:.1f}%",
+                                help=f"Backtest MAPE for {h}-year ahead predictions. RMSE: {acc['rmse']:,.1f}. Based on {acc['n']} test windows.")
+
+                # Multi-horizon backtest chart
+                bt_full = result.get("backtest_full", pd.DataFrame())
+                if not bt_full.empty and len(ha) > 1:
+                    with st.expander("📊 Multi-Horizon Backtest Detail"):
+                        bch1, bch2 = st.columns(2)
+                        with bch1:
+                            # MAPE by horizon bar chart
+                            h_labels = [f"{h}-Year" for h in sorted(ha.keys())]
+                            h_mapes = [ha[h]["mape"] for h in sorted(ha.keys())]
+                            h_colors = [C["teal"] if m < 10 else (C["gold"] if m < 25 else C["coral"]) for m in h_mapes]
+                            fig = go.Figure(go.Bar(x=h_labels, y=h_mapes, marker_color=h_colors,
+                                hovertemplate="<b>%{x}</b><br>MAPE: %{y:.1f}%<extra></extra>"))
+                            fig.update_layout(**BL, title=dict(text="Backtest MAPE by Horizon", font=dict(size=14)),
+                                yaxis_ticksuffix="%", yaxis_title="MAPE (%)")
+                            st.plotly_chart(fig, use_container_width=True)
+
+                        with bch2:
+                            # Actual vs predicted scatter for each horizon
+                            fig = go.Figure()
+                            h_colors_map = {1: C["teal"], 2: C["gold"], 5: C["coral"]}
+                            for h in sorted(ha.keys()):
+                                bh = bt_full[bt_full["horizon"] == h]
+                                fig.add_trace(go.Scatter(x=bh["actual"], y=bh["predicted"],
+                                    mode="markers", name=f"{h}-Year",
+                                    marker=dict(color=h_colors_map.get(h, C["steel"]), size=8, opacity=0.7),
+                                    hovertemplate=f"<b>{h}-yr</b><br>Actual: %{{x:,.1f}}<br>Predicted: %{{y:,.1f}}<extra></extra>"))
+                            # Perfect prediction line
+                            all_vals = pd.concat([bt_full["actual"], bt_full["predicted"]])
+                            mn, mx = all_vals.min(), all_vals.max()
+                            fig.add_trace(go.Scatter(x=[mn, mx], y=[mn, mx], mode="lines",
+                                line=dict(color=C["muted"], width=1, dash="dot"), name="Perfect", showlegend=True))
+                            fmt = {}
+                            if is_dollar: fmt.update({"xaxis_tickprefix": "$", "yaxis_tickprefix": "$"})
+                            if is_pct: fmt.update({"xaxis_ticksuffix": "%", "yaxis_ticksuffix": "%"})
+                            fig.update_layout(**BL, title=dict(text="Predicted vs Actual (All Horizons)", font=dict(size=14)),
+                                xaxis_title="Actual", yaxis_title="Predicted", **fmt)
+                            st.plotly_chart(fig, use_container_width=True)
 
             # Methodology note
             with st.expander("📖 Forecast Methodology"):
