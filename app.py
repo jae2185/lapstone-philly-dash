@@ -1,5 +1,6 @@
 """
 Lapstone LLC — Philadelphia Construction & Real Estate Intelligence Dashboard
+With forecasting engine and metric tooltips.
 """
 import streamlit as st
 import pandas as pd
@@ -45,6 +46,29 @@ TRACT_VARS = [
     "B25070_007E","B25070_008E","B25070_009E","B25070_010E","B25070_011E","B25070_001E",
     "B23025_002E","B23025_005E",
 ]
+
+# ── TOOLTIP DEFINITIONS ──
+TT = {
+    "unemp": "**Unemployment Rate** — % of the civilian labor force without a job but actively seeking work. Source: BLS via FRED.",
+    "const_jobs": "**Construction Jobs** — Total employees in mining, logging, and construction sectors for the Philadelphia metro area. Source: BLS CES via FRED.",
+    "permits": "**Building Permits** — Number of new privately-owned housing units authorized by building permits in the past 12 months. A leading indicator of future construction activity. Source: Census via FRED.",
+    "gdp": "**Gross Domestic Product** — Total market value of all goods and services produced in the Philadelphia-Camden-Wilmington MSA. Source: BEA via FRED.",
+    "homeown": "**Homeownership Rate** — % of occupied housing units that are owner-occupied. Lower rates = more renters = stronger rental demand. Source: Census ACS via FRED.",
+    "pct2534": "**% Age 25–34** — Share of the population in this key young professional demographic. Higher = stronger rental demand signal.",
+    "renter_pct": "**Renter-Occupied %** — Share of housing units occupied by renters (vs owners). Higher = established rental market.",
+    "med_rent": "**Median Gross Rent** — Middle value of monthly rent including utilities. Source: Census ACS 5-Year (B25064).",
+    "med_income": "**Median Household Income** — Middle HH income before taxes. Used to gauge affordability when compared to rent. Source: ACS (B19013).",
+    "burden": "**Rent-Burdened** — % of renter households paying 30%+ of income on rent. HUD defines this as cost-burdened. Source: ACS (B25070).",
+    "r2i": "**Rent-to-Income Ratio** — Annual rent ÷ annual income × 100. Under 30% is generally considered affordable.",
+    "demand_score": "**Demand Score** — Custom composite: 50% young adult concentration + 30% renter prevalence + 20% affordability (inverse rent/income). Range 0–100.",
+    "opp_score": "**Opportunity Score** — Composite: 25% young adults + 25% renter share + 25% affordability + 25% employment strength. Identifies best counties for blue-collar rental investment.",
+    "cpi_shelter": "**Shelter CPI** — Consumer price index for housing costs (rent, owners' equivalent rent). YoY % change shows how fast housing costs are rising.",
+    "forecast": "**Forecast Model** — Uses Ridge regression on lagged FRED indicators (unemployment, permits, CPI, GDP) to predict next-year values. Backtested with expanding-window walk-forward validation.",
+}
+
+def tip(key):
+    """Return a small help icon with tooltip text."""
+    return TT.get(key, "")
 
 # ── DATA FETCHING ──
 @st.cache_data(ttl=3600*6, show_spinner=False)
@@ -162,10 +186,83 @@ def compute_demand_score(df):
     v["score"]=(v["pct2534_n"]*0.5+v["renter_pct_n"]*0.3+(1-v["r2i"].clip(0,60)/60)*0.2)*100
     return v
 
-# ──────────────────────────────────────────────────────────────────────────────
-# PAGE SETUP & CSS
-# ──────────────────────────────────────────────────────────────────────────────
+# ── FORECASTING ENGINE ──
+def build_annual_dataset(fd):
+    """Convert monthly FRED series into annual features for forecasting."""
+    targets = {
+        "Unemployment (%)": "unemp_philly",
+        "Permits (Annual)": "permits_tot",
+        "GDP ($M)": "gdp",
+        "Median Income ($)": "med_income",
+    }
+    features_keys = ["unemp_philly","permits_tot","gdp","cpi_shelter","cpi_all","const_emp","homeown","med_income"]
+    frames = {}
+    for key in features_keys:
+        df = fd.get(key, pd.DataFrame())
+        if df.empty: continue
+        tmp = df.copy(); tmp["year"] = tmp["date"].dt.year
+        if key == "permits_tot":
+            agg = tmp.groupby("year")["value"].sum().rename(key)
+        else:
+            agg = tmp.groupby("year")["value"].last().rename(key)
+        frames[key] = agg
+    if not frames: return pd.DataFrame(), targets
+    annual = pd.concat(frames.values(), axis=1).dropna(how="all")
+    return annual, targets
 
+def run_forecast(annual, target_col, n_backtest=5):
+    """Walk-forward expanding-window Ridge regression forecast."""
+    from sklearn.linear_model import Ridge
+    from sklearn.preprocessing import StandardScaler
+    if target_col not in annual.columns or len(annual) < 8:
+        return None
+    df = annual.dropna(subset=[target_col]).copy()
+    # Create lag features (1-year lag of all available columns)
+    feature_cols = [c for c in df.columns]
+    lagged = df[feature_cols].shift(1)
+    lagged.columns = [f"{c}_lag1" for c in feature_cols]
+    combo = pd.concat([df[[target_col]], lagged], axis=1).dropna()
+    if len(combo) < 6: return None
+    X = combo.drop(columns=[target_col])
+    y = combo[target_col]
+    feat_names = X.columns.tolist()
+    # Walk-forward backtest
+    bt_results = []
+    min_train = max(5, len(combo) - n_backtest - 1)
+    for split in range(min_train, len(combo) - 1):
+        X_tr, y_tr = X.iloc[:split], y.iloc[:split]
+        X_te, y_te = X.iloc[split:split+1], y.iloc[split:split+1]
+        sc = StandardScaler(); X_tr_s = sc.fit_transform(X_tr); X_te_s = sc.transform(X_te)
+        m = Ridge(alpha=1.0); m.fit(X_tr_s, y_tr)
+        pred = m.predict(X_te_s)[0]
+        bt_results.append({"year": y_te.index[0], "actual": y_te.values[0], "predicted": pred})
+    bt = pd.DataFrame(bt_results)
+    if bt.empty: return None
+    bt["error"] = bt["predicted"] - bt["actual"]
+    bt["abs_pct_error"] = (bt["error"].abs() / bt["actual"].abs()) * 100
+    mape = bt["abs_pct_error"].mean()
+    rmse = np.sqrt((bt["error"]**2).mean())
+    # Final forecast: train on ALL data, predict next year
+    sc = StandardScaler(); X_s = sc.fit_transform(X); m = Ridge(alpha=1.0); m.fit(X_s, y)
+    last_row = df[feature_cols].iloc[-1:].copy()
+    last_row.columns = [f"{c}_lag1" for c in feature_cols]
+    forecast_val = m.predict(sc.transform(last_row))[0]
+    forecast_year = int(df.index[-1]) + 1
+    # Confidence interval from backtest residuals
+    std_err = bt["error"].std()
+    ci_low = forecast_val - 1.96 * std_err
+    ci_high = forecast_val + 1.96 * std_err
+    # Feature importance
+    coefs = pd.Series(m.coef_, index=feat_names).abs().sort_values(ascending=False)
+    return {
+        "backtest": bt, "mape": mape, "rmse": rmse,
+        "forecast_year": forecast_year, "forecast_val": forecast_val,
+        "ci_low": ci_low, "ci_high": ci_high,
+        "last_actual_year": int(df.index[-1]), "last_actual_val": y.iloc[-1],
+        "importance": coefs, "n_train": len(combo),
+    }
+
+# ── PAGE SETUP ──
 st.set_page_config(page_title="Lapstone Intel — Philly Dashboard", page_icon="🏗️", layout="wide", initial_sidebar_state="expanded")
 st.markdown("""
 <style>
@@ -213,24 +310,22 @@ with st.sidebar:
     st.divider()
     st.markdown('<div style="color:#5A6270;font-size:.75rem;margin-top:1rem"><b>Data Sources</b><br>• FRED • Census ACS • BLS QCEW<br><br>Built for <a href="https://www.lapstonellc.com" target="_blank" style="color:#C8A951;">Lapstone LLC</a></div>', unsafe_allow_html=True)
 
-# ── HEADER ──
 st.markdown('<div class="dashboard-header"><h1>Philadelphia Metro Intelligence</h1><p>Construction economy, rental demand, and demographic analytics for the greater Philadelphia region</p></div>', unsafe_allow_html=True)
 
-# ── PREFETCH FRED ──
+# ── PREFETCH ──
 fd={}
 if FRED_API_KEY:
     with st.spinner("Loading FRED data…"):
         for k,sid in FRED_SERIES.items(): fd[k]=fetch_fred(sid,start_date)
 sel_fips={k:v for k,v in COUNTY_FIPS.items() if k in sel_counties}
 
-# ── TABS ──
-t_ov,t_con,t_rent,t_maps,t_demo,t_reg=st.tabs(["📊 Overview","🏗️ Construction","🏠 Rental Demand","🗺️ Tract Maps","👥 Demographics","📍 Regional"])
+t_ov,t_con,t_rent,t_maps,t_demo,t_reg,t_fc=st.tabs(["📊 Overview","🏗️ Construction","🏠 Rental Demand","🗺️ Tract Maps","👥 Demographics","📍 Regional","🔮 Forecast"])
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 1: OVERVIEW
+# TAB 1: OVERVIEW (with tooltips)
 # ══════════════════════════════════════════════════════════════════════════════
 with t_ov:
-    if not FRED_API_KEY: st.info("👈 Enter your **FRED API key** in the sidebar. Free at [fred.stlouisfed.org](https://fred.stlouisfed.org/docs/api/api_key.html)")
+    if not FRED_API_KEY: st.info("👈 Enter your **FRED API key** in the sidebar.")
     st.markdown('<div class="section-label">Key Indicators</div>',unsafe_allow_html=True)
     def slat(k):
         df=fd.get(k,pd.DataFrame())
@@ -240,27 +335,27 @@ with t_ov:
     c1,c2,c3,c4,c5=st.columns(5)
     with c1:
         v,p=slat("unemp_philly"); d=f"{v-p:+.1f}pp YoY" if v is not None and p is not None else None
-        st.metric("Unemployment Rate",f"{v:.1f}%" if v else "—",d,delta_color="inverse")
+        st.metric("Unemployment Rate",f"{v:.1f}%" if v else "—",d,delta_color="inverse",help=tip("unemp"))
     with c2:
         v,p=slat("const_emp"); d=f"{((v/p)-1)*100:+.1f}% YoY" if v and p else None
-        st.metric("Construction Jobs (MSA)",f"{v:,.0f}K" if v else "—",d)
+        st.metric("Construction Jobs",f"{v:,.1f}K" if v else "—",d,help=tip("const_jobs"))
     with c3:
         dp=fd.get("permits_tot",pd.DataFrame())
         if not dp.empty and len(dp)>=12:
             r12=dp.tail(12)["value"].sum(); p12=dp.iloc[-24:-12]["value"].sum() if len(dp)>=24 else None
             d=f"{((r12/p12)-1)*100:+.1f}% YoY" if p12 and p12>0 else None
-            st.metric("Permits (12-mo)",f"{r12:,.0f}",d)
-        else: st.metric("Permits","—")
+            st.metric("Permits (12-mo)",f"{r12:,.0f}",d,help=tip("permits"))
+        else: st.metric("Permits","—",help=tip("permits"))
     with c4:
         v,p=slat("gdp"); d=f"{((v/p)-1)*100:+.1f}% YoY" if v and p else None
         def fnum(n):
             if n is None: return "—"
             if n>=1e3: return f"${n/1e3:,.0f}B"
             return f"${n:,.0f}M"
-        st.metric("GDP (Philly MSA)",fnum(v),d)
+        st.metric("GDP (Philly MSA)",fnum(v),d,help=tip("gdp"))
     with c5:
         v,p=slat("homeown"); d=f"{v-p:+.1f}pp" if v is not None and p is not None else None
-        st.metric("Homeownership",f"{v:.1f}%" if v else "—",d,delta_color="off")
+        st.metric("Homeownership",f"{v:.1f}%" if v else "—",d,delta_color="off",help=tip("homeown"))
     st.markdown("")
     cl,cr=st.columns(2)
     with cl: st.plotly_chart(lchart(fd.get("unemp_philly",pd.DataFrame()),"Unemployment — Philadelphia County","Rate",C["coral"],True,ys="%"),use_container_width=True)
@@ -268,7 +363,6 @@ with t_ov:
     cl2,cr2=st.columns(2)
     with cl2: st.plotly_chart(lchart(fd.get("permits_tot",pd.DataFrame()),"Building Permits — Philly MSA (Monthly)","Permits",C["gold"],True),use_container_width=True)
     with cr2: st.plotly_chart(lchart(fd.get("gdp",pd.DataFrame()),"GDP — Philly MSA ($M)","GDP",C["lavender"],yp="$"),use_container_width=True)
-    # CPI
     st.markdown('<div class="section-label">Inflation & Income</div>',unsafe_allow_html=True)
     cc1,cc2=st.columns(2)
     with cc1:
@@ -307,7 +401,6 @@ with t_con:
                 fill="tozeroy",fillcolor="rgba(200,169,81,0.08)",hovertemplate="<b>%{x|%b %Y}</b><br>%{y:.2f}%<extra></extra>"))
             fig.update_layout(**BL,title=dict(text="Construction % of Employment",font=dict(size=16)),yaxis_ticksuffix="%")
             st.plotly_chart(fig,use_container_width=True)
-    # QCEW
     st.markdown('<div class="section-label">BLS QCEW — Construction Industry</div>',unsafe_allow_html=True)
     qy=st.selectbox("Year",["2024","2023","2022","2021","2020"],index=0)
     qcew=fetch_qcew("42101",qy,"1")
@@ -330,7 +423,6 @@ with t_con:
                 with sc1: st.plotly_chart(bchart(sub["label"].tolist(),sub["annual_avg_emplvl"].tolist(),f"Employment — {qy}",C["teal"],yl="Employees"),use_container_width=True)
                 with sc2:
                     if "avg_annual_pay" in sub.columns: st.plotly_chart(bchart(sub["label"].tolist(),sub["avg_annual_pay"].tolist(),f"Avg Pay — {qy}",C["gold"],yl="Pay",yp="$"),use_container_width=True)
-    # Annual permits
     st.markdown('<div class="section-label">Annual Permit Trend</div>',unsafe_allow_html=True)
     pm=fd.get("permits_tot",pd.DataFrame())
     if not pm.empty:
@@ -343,7 +435,7 @@ with t_con:
         st.plotly_chart(fig,use_container_width=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 3: RENTAL DEMAND
+# TAB 3: RENTAL DEMAND (with tooltips)
 # ══════════════════════════════════════════════════════════════════════════════
 with t_rent:
     st.markdown('<div class="section-label">Rental Market — Young Professional Demand</div>',unsafe_allow_html=True)
@@ -356,10 +448,10 @@ with t_rent:
             pr=cdata[cdata["county_label"]=="Philadelphia"]
             if not pr.empty:
                 pr=pr.iloc[0]; m1,m2,m3,m4=st.columns(4)
-                with m1: st.metric("Young Adults (25–34)",f"{pr['pop2534']:,.0f}")
-                with m2: st.metric("% Population 25–34",f"{pr['pct2534']:.1f}%")
-                with m3: st.metric("Median Rent",f"${pr['B25064_001E']:,.0f}")
-                with m4: st.metric("% Renters",f"{pr['renter_pct']:.1f}%")
+                with m1: st.metric("Young Adults (25–34)",f"{pr['pop2534']:,.0f}",help=tip("pct2534"))
+                with m2: st.metric("% Population 25–34",f"{pr['pct2534']:.1f}%",help=tip("pct2534"))
+                with m3: st.metric("Median Rent",f"${pr['B25064_001E']:,.0f}",help=tip("med_rent"))
+                with m4: st.metric("% Renters",f"{pr['renter_pct']:.1f}%",help=tip("renter_pct"))
             st.markdown("")
             r1,r2=st.columns(2)
             with r1:
@@ -375,7 +467,6 @@ with t_rent:
             with r4:
                 s=cdata.sort_values("burden_pct",ascending=True)
                 st.plotly_chart(bchart(s["county_label"].tolist(),s["burden_pct"].tolist(),"Rent-Burdened (30%+ Income)",C["lavender"],True,"Burdened %"),use_container_width=True)
-            # Scatter
             st.markdown('<div class="section-label">Affordability Matrix</div>',unsafe_allow_html=True)
             fig=go.Figure(go.Scatter(x=cdata["B19013_001E"],y=cdata["B25064_001E"],mode="markers+text",
                 text=cdata["county_label"],textposition="top center",textfont=dict(size=11,color=C["text"]),
@@ -386,7 +477,6 @@ with t_rent:
             fig.update_layout(**BL,title=dict(text="Rent vs Income (Bubble=Young Adult %)",font=dict(size=16)),
                 xaxis_title="Median HH Income",yaxis_title="Median Rent",xaxis_tickprefix="$",yaxis_tickprefix="$")
             st.plotly_chart(fig,use_container_width=True)
-        # Tract-level
         st.markdown('<div class="section-label">Tract-Level Hotspots (Philadelphia)</div>',unsafe_allow_html=True)
         tdf=fetch_acs_tracts(TRACT_VARS,"42","101")
         if not tdf.empty:
@@ -417,7 +507,7 @@ with t_rent:
 # ══════════════════════════════════════════════════════════════════════════════
 with t_maps:
     st.markdown('<div class="section-label">Interactive Census Tract Maps</div>',unsafe_allow_html=True)
-    st.markdown('<div class="info-box">Choropleth maps at <b>census-tract level</b>. Hover any tract for details. Select metric and counties below.</div>',unsafe_allow_html=True)
+    st.markdown('<div class="info-box">Choropleth maps at <b>census-tract level</b>. Hover any tract for details.</div>',unsafe_allow_html=True)
     if not CENSUS_API_KEY: st.info("👈 Enter Census API key.")
     else:
         pa_counties={k:v for k,v in COUNTY_FIPS.items() if v[0]=="42"}
@@ -433,9 +523,7 @@ with t_maps:
             if geo and not atract.empty:
                 atract=compute_tract_metrics(atract)
                 atract["GEOID"]=atract["state"]+atract["county"]+atract["tract"]
-                # demand score for all
                 scored=compute_demand_score(atract)
-                # metric mapping
                 mmap={"Young Adults (% Age 25–34)":("pct2534","% 25-34","","%"),
                     "Median Gross Rent ($)":("B25064_001E","Median Rent","$",""),
                     "Renter-Occupied (%)":("renter_pct","% Renters","","%"),
@@ -446,15 +534,12 @@ with t_maps:
                 zcol,zlbl,zpre,zsuf=mmap[map_metric]
                 pdf=scored if zcol=="score" else atract
                 pdf=pdf.dropna(subset=[zcol])
-                # filter geojson features
                 cfset=set(atract["state"]+atract["county"])
                 fgeo={"type":"FeatureCollection","features":[
                     f for f in geo["features"] if f["properties"]["STATEFP"]+f["properties"]["COUNTYFP"] in cfset]}
                 zoom=10.5 if len(map_sel)==1 else (9.5 if len(map_sel)<=3 else 8.5)
-                if zcol in ["burden_pct","r2i"]:
-                    cs=[[0,C["teal"]],[0.5,C["sand"]],[1,C["coral"]]]
-                else:
-                    cs=[[0,C["slate"]],[0.5,C["teal"]],[1,C["gold"]]]
+                if zcol in ["burden_pct","r2i"]: cs=[[0,C["teal"]],[0.5,C["sand"]],[1,C["coral"]]]
+                else: cs=[[0,C["slate"]],[0.5,C["teal"]],[1,C["gold"]]]
                 fig=go.Figure(go.Choroplethmapbox(
                     geojson=fgeo,locations=pdf["GEOID"],z=pdf[zcol],
                     featureidkey="properties.GEOID",text=pdf["NAME"],
@@ -468,15 +553,14 @@ with t_maps:
                     paper_bgcolor="rgba(0,0,0,0)",font=dict(color=C["text"],family="DM Sans"),
                     margin=dict(l=0,r=0,t=50,b=0),
                     title=dict(text=f"{map_metric} — Census Tract Level",font=dict(size=16,color=C["text"])),height=620)
-                st.plotly_chart(fig,use_container_width=True)
+                st.plotly_chart(fig,use_container_width=True,config={"scrollZoom":True,"displayModeBar":True})
                 st.markdown(f"**{len(pdf):,} tracts** across {', '.join(map_sel)}")
                 s1,s2,s3,s4=st.columns(4)
-                with s1: st.metric(f"Min",f"{zpre}{pdf[zcol].min():,.1f}{zsuf}")
-                with s2: st.metric(f"Median",f"{zpre}{pdf[zcol].median():,.1f}{zsuf}")
-                with s3: st.metric(f"Mean",f"{zpre}{pdf[zcol].mean():,.1f}{zsuf}")
-                with s4: st.metric(f"Max",f"{zpre}{pdf[zcol].max():,.1f}{zsuf}")
-            elif geo is None:
-                st.warning("Could not load tract boundaries. Make sure `geopandas` is installed.")
+                with s1: st.metric("Min",f"{zpre}{pdf[zcol].min():,.1f}{zsuf}")
+                with s2: st.metric("Median",f"{zpre}{pdf[zcol].median():,.1f}{zsuf}")
+                with s3: st.metric("Mean",f"{zpre}{pdf[zcol].mean():,.1f}{zsuf}")
+                with s4: st.metric("Max",f"{zpre}{pdf[zcol].max():,.1f}{zsuf}")
+            elif geo is None: st.warning("Could not load tract boundaries. Make sure `geopandas` is installed.")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 5: DEMOGRAPHICS
@@ -515,7 +599,6 @@ with t_demo:
             fig.update_layout(**BL,barmode="stack",title=dict(text="Age Distribution (%)",font=dict(size=16)),
                 yaxis_ticksuffix="%",legend=dict(orientation="h",y=-0.15,bgcolor="rgba(0,0,0,0)",font=dict(size=11)))
             st.plotly_chart(fig,use_container_width=True)
-        # Education
         st.markdown('<div class="section-label">Education (25+)</div>',unsafe_allow_html=True)
         ev=["B15003_001E","B15003_022E","B15003_023E","B15003_024E","B15003_025E","B15003_017E","B15003_018E"]
         edf=fetch_acs_counties(ev,sel_fips)
@@ -532,7 +615,7 @@ with t_demo:
                 st.plotly_chart(bchart(s["county_label"].tolist(),s["hs"].tolist(),"HS/GED Only (%)",C["sand"],True,"% 25+"),use_container_width=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 6: REGIONAL
+# TAB 6: REGIONAL (with tooltips, no background_gradient)
 # ══════════════════════════════════════════════════════════════════════════════
 with t_reg:
     st.markdown('<div class="section-label">Regional Comparison</div>',unsafe_allow_html=True)
@@ -541,7 +624,6 @@ with t_reg:
         comp=fetch_acs_counties(TRACT_VARS,COUNTY_FIPS)
         if not comp.empty:
             comp=compute_tract_metrics(comp)
-            # Scorecard
             st.markdown('<div class="section-label">Scorecard</div>',unsafe_allow_html=True)
             disp=comp[["county_label","B01003_001E","B19013_001E","B25064_001E","pct2534","renter_pct","r2i","unemp"]].rename(columns={
                 "county_label":"County","B01003_001E":"Population","B19013_001E":"Med Income",
@@ -550,9 +632,8 @@ with t_reg:
             st.dataframe(disp.style.format({"Population":"{:,.0f}","Med Income":"${:,.0f}","Med Rent":"${:,.0f}",
                 "% 25-34":"{:.1f}%","% Renters":"{:.1f}%","Rent/Inc %":"{:.1f}%","Unemp %":"{:.1f}%"
             }),use_container_width=True,hide_index=True)
-            # Opportunity Score
             st.markdown('<div class="section-label">Blue-Collar Rental Opportunity Score</div>',unsafe_allow_html=True)
-            st.markdown('<div class="info-box">Composite: Young adults (25%) + Renter prevalence (25%) + Affordability (25%) + Employment (25%).</div>',unsafe_allow_html=True)
+            st.markdown(f'<div class="info-box">{tip("opp_score")}</div>',unsafe_allow_html=True)
             factors={"pct2534":True,"renter_pct":True,"r2i":False,"unemp":False}
             for col,higher in factors.items():
                 mn,mx=comp[col].min(),comp[col].max()
@@ -573,6 +654,112 @@ with t_reg:
                 sb["Total"]=sb["Total"].round(1)
                 st.dataframe(sb,use_container_width=True,hide_index=True)
     else: st.info("Enter Census API key in sidebar.")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 7: FORECAST (NEW)
+# ══════════════════════════════════════════════════════════════════════════════
+with t_fc:
+    st.markdown('<div class="section-label">Forecasting Engine</div>',unsafe_allow_html=True)
+    st.markdown(f'<div class="info-box">{tip("forecast")}</div>',unsafe_allow_html=True)
+
+    if not FRED_API_KEY:
+        st.info("👈 Enter FRED API key to enable forecasting.")
+    else:
+        # Need longer history for forecasting
+        fd_full = {}
+        with st.spinner("Loading full history for forecasting…"):
+            for k, sid in FRED_SERIES.items():
+                fd_full[k] = fetch_fred(sid, "2001-01-01")
+
+        annual, targets = build_annual_dataset(fd_full)
+
+        if annual.empty:
+            st.warning("Not enough data to build forecasts.")
+        else:
+            st.markdown(f"**{len(annual)} years** of annual data assembled ({int(annual.index.min())}–{int(annual.index.max())})")
+
+            for target_label, target_key in targets.items():
+                if target_key not in annual.columns:
+                    continue
+
+                st.markdown(f'<div class="section-label">{target_label}</div>', unsafe_allow_html=True)
+                result = run_forecast(annual, target_key)
+
+                if result is None:
+                    st.markdown("_Insufficient data for this forecast._")
+                    continue
+
+                # Metrics row
+                fc1, fc2, fc3, fc4 = st.columns(4)
+                is_dollar = "$" in target_label
+                is_pct = "%" in target_label
+                pref = "$" if is_dollar else ""
+                suf = "%" if is_pct else ""
+
+                def fv(v):
+                    if is_dollar and abs(v) >= 1e6: return f"${v/1e6:,.0f}M"
+                    if is_dollar and abs(v) >= 1e3: return f"${v/1e3:,.0f}K"
+                    if is_dollar: return f"${v:,.0f}"
+                    if is_pct: return f"{v:.1f}%"
+                    return f"{v:,.0f}"
+
+                chg = result["forecast_val"] - result["last_actual_val"]
+                chg_pct = (chg / abs(result["last_actual_val"])) * 100 if result["last_actual_val"] != 0 else 0
+
+                with fc1: st.metric(f"{result['last_actual_year']} (Actual)", fv(result["last_actual_val"]))
+                with fc2: st.metric(f"{result['forecast_year']} (Forecast)", fv(result["forecast_val"]),
+                    f"{chg_pct:+.1f}%", delta_color="normal" if not is_pct else ("inverse" if "Unemployment" in target_label else "normal"))
+                with fc3: st.metric("95% CI", f"{fv(result['ci_low'])} – {fv(result['ci_high'])}")
+                with fc4: st.metric("Backtest MAPE", f"{result['mape']:.1f}%", help="Mean Absolute Percentage Error on walk-forward backtest. Lower = more accurate.")
+
+                # Charts: backtest + forecast
+                bt = result["backtest"]
+                ch1, ch2 = st.columns(2)
+                with ch1:
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(x=bt["year"], y=bt["actual"], mode="lines+markers",
+                        name="Actual", line=dict(color=C["teal"], width=2.5), marker=dict(size=6)))
+                    fig.add_trace(go.Scatter(x=bt["year"], y=bt["predicted"], mode="lines+markers",
+                        name="Predicted", line=dict(color=C["gold"], width=2, dash="dash"), marker=dict(size=6, symbol="diamond")))
+                    # Add forecast point
+                    fig.add_trace(go.Scatter(x=[result["forecast_year"]], y=[result["forecast_val"]],
+                        mode="markers", name=f"{result['forecast_year']} Forecast",
+                        marker=dict(size=12, color=C["coral"], symbol="star")))
+                    # CI band
+                    fig.add_shape(type="rect", x0=result["forecast_year"]-0.3, x1=result["forecast_year"]+0.3,
+                        y0=result["ci_low"], y1=result["ci_high"],
+                        fillcolor="rgba(231,111,81,0.15)", line=dict(width=0))
+                    fmt = {}
+                    if is_dollar: fmt["yaxis_tickprefix"] = "$"
+                    if is_pct: fmt["yaxis_ticksuffix"] = "%"
+                    fig.update_layout(**BL, title=dict(text=f"Backtest + Forecast: {target_label}", font=dict(size=14)), **fmt)
+                    st.plotly_chart(fig, use_container_width=True)
+
+                with ch2:
+                    # Feature importance
+                    imp = result["importance"].head(6)
+                    clean_names = [n.replace("_lag1","").replace("_"," ").title() for n in imp.index]
+                    fig = go.Figure(go.Bar(y=clean_names[::-1], x=imp.values[::-1], orientation="h",
+                        marker_color=C["teal"],
+                        hovertemplate="<b>%{y}</b><br>Importance: %{x:.3f}<extra></extra>"))
+                    fig.update_layout(**BL, title=dict(text="Feature Importance (Abs Coefficients)", font=dict(size=14)))
+                    st.plotly_chart(fig, use_container_width=True)
+
+            # Methodology note
+            with st.expander("📖 Forecast Methodology"):
+                st.markdown("""
+**Model:** Ridge Regression with L2 regularization (α=1.0)
+
+**Features:** 1-year lagged values of all available FRED indicators (unemployment, permits, GDP, CPI shelter, CPI all items, construction employment, homeownership, median income)
+
+**Validation:** Expanding-window walk-forward backtest — the model is retrained at each step using only data available up to that point, then predicts the next year. This prevents data leakage and simulates real-world forecasting conditions.
+
+**Confidence Interval:** 95% CI derived from the standard deviation of backtest residuals (±1.96σ)
+
+**MAPE:** Mean Absolute Percentage Error across all backtest windows. Under 5% is excellent; under 10% is good.
+
+**Limitations:** Annual frequency limits sample size. Model assumes linear relationships and stable regime. Structural breaks (pandemics, policy shifts) may not be captured. GDP data lags ~1 year from BEA.
+""")
 
 # ── FOOTER ──
 st.markdown("---")
