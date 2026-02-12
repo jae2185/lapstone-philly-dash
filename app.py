@@ -25,7 +25,7 @@ FRED_SERIES = {
     "unemp_philly":"PAPHIL5URN","pop_philly":"PAPHIL5POP",
     "labor_force":"LAUCN421010000000006","med_income":"MHIPA42101A052NCEN",
     "homeown":"HOWNRATEACS042101","unemp_msa":"PHIL942URN",
-    "const_emp":"SMU42379801500000001SA","nonfarm":"SMU42379800000000001SA",
+    "const_emp":"SMU42979611500000001SA","nonfarm":"SMU42379800000000001SA",
     "permits_tot":"PHIL942BPPRIV","permits_1u":"PHIL942BP1FH",
     "gdp":"NGMP37980","cpi_shelter":"CUURA102SAH1","cpi_all":"CUURA102SA0",
 }
@@ -264,7 +264,7 @@ with t_ov:
     st.markdown("")
     cl,cr=st.columns(2)
     with cl: st.plotly_chart(lchart(fd.get("unemp_philly",pd.DataFrame()),"Unemployment — Philadelphia County","Rate",C["coral"],True,ys="%"),use_container_width=True)
-    with cr: st.plotly_chart(lchart(fd.get("const_emp",pd.DataFrame()),"Construction Employment — Philly MSA (K)","Jobs",C["teal"],True),use_container_width=True)
+    with cr: st.plotly_chart(lchart(fd.get("const_emp",pd.DataFrame()),"Construction Employment — Philadelphia (K)","Jobs",C["teal"],True),use_container_width=True)
     cl2,cr2=st.columns(2)
     with cl2: st.plotly_chart(lchart(fd.get("permits_tot",pd.DataFrame()),"Building Permits — Philly MSA (Monthly)","Permits",C["gold"],True),use_container_width=True)
     with cr2: st.plotly_chart(lchart(fd.get("gdp",pd.DataFrame()),"GDP — Philly MSA ($M)","GDP",C["lavender"],yp="$"),use_container_width=True)
@@ -305,7 +305,7 @@ with t_con:
             m=ce.merge(nf,on="date",suffixes=("_c","_t")); m["pct"]=(m["value_c"]/m["value_t"])*100
             fig=go.Figure(go.Scatter(x=m["date"],y=m["pct"],mode="lines",line=dict(color=C["gold"],width=2.5),
                 fill="tozeroy",fillcolor="rgba(200,169,81,0.08)",hovertemplate="<b>%{x|%b %Y}</b><br>%{y:.2f}%<extra></extra>"))
-            fig.update_layout(**BL,title=dict(text="Construction % of Total Employment",font=dict(size=16)),yaxis_ticksuffix="%")
+            fig.update_layout(**BL,title=dict(text="Construction % of Employment",font=dict(size=16)),yaxis_ticksuffix="%")
             st.plotly_chart(fig,use_container_width=True)
     # QCEW
     st.markdown('<div class="section-label">BLS QCEW — Construction Industry</div>',unsafe_allow_html=True)
