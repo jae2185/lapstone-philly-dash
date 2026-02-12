@@ -1,1624 +1,577 @@
 """
 Lapstone LLC — Philadelphia Construction & Real Estate Intelligence Dashboard
-==============================================================================
-Pulls live data from FRED, Census ACS, and BLS to provide a comprehensive
-view of the Philadelphia metro area's construction economy, demographics,
-and rental market dynamics.
 """
-
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-import plotly.express as px
-from plotly.subplots import make_subplots
-import requests
-from datetime import datetime, timedelta
-import json
-import os
+import requests, json, zipfile, io, os
+from datetime import datetime
 
-# ──────────────────────────────────────────────────────────────────────────────
-# CONFIG & CONSTANTS
-# ──────────────────────────────────────────────────────────────────────────────
+# ── CONFIG ──
+def _secret(k):
+    try: return st.secrets[k]
+    except Exception: return os.environ.get(k, "")
 
-def _get_secret(key: str) -> str:
-    """Try st.secrets first (Streamlit Cloud), then env vars."""
-    try:
-        return st.secrets[key]
-    except Exception:
-        return os.environ.get(key, "")
+FRED_API_KEY = _secret("FRED_API_KEY")
+CENSUS_API_KEY = _secret("CENSUS_API_KEY")
 
-FRED_API_KEY = _get_secret("FRED_API_KEY")
-CENSUS_API_KEY = _get_secret("CENSUS_API_KEY")
-
-# FIPS Codes
-PHILLY_COUNTY_FIPS = "42101"  # Philadelphia County
-PA_STATE_FIPS = "42"
-
-# Surrounding counties
 COUNTY_FIPS = {
-    "Philadelphia": "42101",
-    "Montgomery": "42091",
-    "Bucks": "42017",
-    "Delaware": "42045",
-    "Chester": "42029",
-    "Berks (Reading)": "42011",
-    "Camden (NJ)": "34007",
-    "Burlington (NJ)": "34005",
-    "Gloucester (NJ)": "34015",
+    "Philadelphia":("42","101"),"Montgomery":("42","091"),"Bucks":("42","017"),
+    "Delaware":("42","045"),"Chester":("42","029"),"Berks (Reading)":("42","011"),
+    "Camden (NJ)":("34","007"),"Burlington (NJ)":("34","005"),"Gloucester (NJ)":("34","015"),
 }
-
-# FRED Series
 FRED_SERIES = {
-    "Unemployment Rate (Philly County)": "PAPHIL5URN",
-    "Unemployment Rate (Philly MSA)": "PHIL942URN",
-    "Building Permits (MSA, Total)": "PHIL942BPPRIV",
-    "Building Permits (MSA, 1-Unit)": "PHIL942BP1FH",
-    "All Employees: Construction (MSA)": "PHIL942CONS",
-    "All Employees: Total Nonfarm (MSA)": "PHIL942NA",
-    "Labor Force (Philly County)": "LAUCN421010000000006",
-    "Homeownership Rate (Philly)": "HOWNRATEACS042101",
-    "Resident Population (Philly County)": "PAPHIL5POP",
-    "GDP (Philly MSA)": "NGMP37964",
-    "Median HH Income (Philly County)": "MHIPA42101A052NCEN",
-    "CPI: Shelter (Philly MSA)": "CUURS12ASAH",
-    "CPI: All Items (Philly MSA)": "CUURS12ASA0",
+    "unemp_philly":"PAPHIL5URN","pop_philly":"PAPHIL5POP",
+    "labor_force":"LAUCN421010000000006","med_income":"MHIPA42101A052NCEN",
+    "homeown":"HOWNRATEACS042101","unemp_msa":"PHIL942URN",
+    "const_emp":"PHIL942CONS","nonfarm":"PHIL942NA",
+    "permits_tot":"PHIL942BPPRIV","permits_1u":"PHIL942BP1FH",
+    "gdp":"NGMP37964","cpi_shelter":"CUURS12ASAH","cpi_all":"CUURS12ASA0",
 }
+C = {"gold":"#C8A951","slate":"#4A6274","teal":"#2EC4B6","coral":"#E76F51",
+     "lavender":"#9B8EC7","sky":"#48A9A6","sand":"#D4A373","steel":"#7F8C9B",
+     "bg":"#0E1117","card":"#1A1D26","text":"#E8E8E8","muted":"#7F8C9B"}
+BL = dict(paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(0,0,0,0)",
+    font=dict(color=C["text"],family="DM Sans, sans-serif"),
+    margin=dict(l=40,r=20,t=50,b=40),
+    xaxis=dict(gridcolor="rgba(255,255,255,0.06)",zeroline=False),
+    yaxis=dict(gridcolor="rgba(255,255,255,0.06)",zeroline=False),
+    hoverlabel=dict(bgcolor=C["card"],font_size=12,font_family="DM Sans"))
 
-# Plotly color palette — dark theme with gold accent (Lapstone branding)
-COLORS = {
-    "gold": "#C8A951",
-    "slate": "#4A6274",
-    "teal": "#2EC4B6",
-    "coral": "#E76F51",
-    "lavender": "#9B8EC7",
-    "sky": "#48A9A6",
-    "sand": "#D4A373",
-    "steel": "#7F8C9B",
-    "bg": "#0E1117",
-    "card": "#1A1D26",
-    "text": "#E8E8E8",
-    "muted": "#7F8C9B",
-}
+TRACT_VARS = [
+    "B01001_011E","B01001_012E","B01001_035E","B01001_036E","B01003_001E",
+    "B25064_001E","B19013_001E","B25003_001E","B25003_003E",
+    "B25070_007E","B25070_008E","B25070_009E","B25070_010E","B25070_011E","B25070_001E",
+    "B23025_002E","B23025_005E",
+]
 
-CHART_LAYOUT = dict(
-    paper_bgcolor="rgba(0,0,0,0)",
-    plot_bgcolor="rgba(0,0,0,0)",
-    font=dict(color=COLORS["text"], family="DM Sans, sans-serif"),
-    margin=dict(l=40, r=20, t=50, b=40),
-    xaxis=dict(gridcolor="rgba(255,255,255,0.06)", zeroline=False),
-    yaxis=dict(gridcolor="rgba(255,255,255,0.06)", zeroline=False),
-    legend=dict(
-        bgcolor="rgba(0,0,0,0)",
-        font=dict(size=11),
-    ),
-    hoverlabel=dict(
-        bgcolor=COLORS["card"],
-        font_size=12,
-        font_family="DM Sans",
-    ),
-)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# DATA FETCHING UTILITIES
-# ──────────────────────────────────────────────────────────────────────────────
-
-@st.cache_data(ttl=3600 * 6)
-def fetch_fred_series(series_id: str, start: str = "2010-01-01") -> pd.DataFrame:
-    """Fetch a single FRED series. Returns DataFrame with date + value."""
-    if not FRED_API_KEY:
-        return pd.DataFrame()
-    url = "https://api.stlouisfed.org/fred/series/observations"
-    params = {
-        "series_id": series_id,
-        "api_key": FRED_API_KEY,
-        "file_type": "json",
-        "observation_start": start,
-    }
+# ── DATA FETCHING ──
+@st.cache_data(ttl=3600*6, show_spinner=False)
+def fetch_fred(sid, start="2010-01-01"):
+    if not FRED_API_KEY: return pd.DataFrame(columns=["date","value"])
     try:
-        r = requests.get(url, params=params, timeout=15)
-        r.raise_for_status()
-        obs = r.json().get("observations", [])
-        df = pd.DataFrame(obs)
-        if df.empty:
-            return df
-        df["date"] = pd.to_datetime(df["date"])
-        df["value"] = pd.to_numeric(df["value"], errors="coerce")
-        df = df.dropna(subset=["value"])
-        return df[["date", "value"]].reset_index(drop=True)
-    except Exception as e:
-        st.warning(f"FRED fetch error for {series_id}: {e}")
-        return pd.DataFrame()
+        r = requests.get("https://api.stlouisfed.org/fred/series/observations",
+            params={"series_id":sid,"api_key":FRED_API_KEY,"file_type":"json",
+                    "observation_start":start,"sort_order":"asc"}, timeout=20)
+        if r.status_code!=200: return pd.DataFrame(columns=["date","value"])
+        obs = r.json().get("observations",[])
+        if not obs: return pd.DataFrame(columns=["date","value"])
+        df = pd.DataFrame(obs); df["date"]=pd.to_datetime(df["date"])
+        df["value"]=pd.to_numeric(df["value"],errors="coerce")
+        return df.dropna(subset=["value"])[["date","value"]].reset_index(drop=True)
+    except Exception: return pd.DataFrame(columns=["date","value"])
 
-
-@st.cache_data(ttl=3600 * 12)
-def fetch_census_acs(
-    variables: list[str],
-    geo: str = "county:*",
-    state: str = "42",
-    year: int = 2023,
-    dataset: str = "acs/acs5",
-) -> pd.DataFrame:
-    """Fetch variables from Census ACS API. Returns raw DataFrame."""
-    if not CENSUS_API_KEY:
-        return pd.DataFrame()
-    base = f"https://api.census.gov/data/{year}/{dataset}"
-    get_vars = ",".join(["NAME"] + variables)
-    params = {
-        "get": get_vars,
-        "for": geo,
-        "key": CENSUS_API_KEY,
-    }
-    if geo.startswith("tract") or geo.startswith("county"):
-        params["in"] = f"state:{state}"
-    try:
-        r = requests.get(base, params=params, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        if len(data) < 2:
-            return pd.DataFrame()
-        df = pd.DataFrame(data[1:], columns=data[0])
-        return df
-    except Exception as e:
-        st.warning(f"Census ACS error: {e}")
-        return pd.DataFrame()
-
-
-@st.cache_data(ttl=3600 * 12)
-def fetch_census_acs_county_multi(
-    variables: list[str],
-    county_fips: dict,
-    year: int = 2023,
-    dataset: str = "acs/acs5",
-) -> pd.DataFrame:
-    """Fetch ACS data for multiple specific counties."""
-    if not CENSUS_API_KEY:
-        return pd.DataFrame()
-    frames = []
-    for name, fips in county_fips.items():
-        state = fips[:2]
-        county = fips[2:]
-        base = f"https://api.census.gov/data/{year}/{dataset}"
-        get_vars = ",".join(["NAME"] + variables)
-        params = {
-            "get": get_vars,
-            "for": f"county:{county}",
-            "in": f"state:{state}",
-            "key": CENSUS_API_KEY,
-        }
+@st.cache_data(ttl=3600*12, show_spinner=False)
+def fetch_acs_counties(variables, cfips, year=2023):
+    if not CENSUS_API_KEY: return pd.DataFrame()
+    frames=[]
+    for name,(st_,co) in cfips.items():
         try:
-            r = requests.get(base, params=params, timeout=15)
-            r.raise_for_status()
-            data = r.json()
-            if len(data) >= 2:
-                row = pd.DataFrame(data[1:], columns=data[0])
-                row["county_label"] = name
-                frames.append(row)
-        except Exception:
-            pass
-    if frames:
-        return pd.concat(frames, ignore_index=True)
-    return pd.DataFrame()
+            r=requests.get(f"https://api.census.gov/data/{year}/acs/acs5",
+                params={"get":f"NAME,{','.join(variables)}","for":f"county:{co}",
+                        "in":f"state:{st_}","key":CENSUS_API_KEY}, timeout=15)
+            if r.status_code==200:
+                d=r.json()
+                if len(d)>=2:
+                    row=pd.DataFrame(d[1:],columns=d[0]); row["county_label"]=name; frames.append(row)
+        except Exception: pass
+    return pd.concat(frames,ignore_index=True) if frames else pd.DataFrame()
 
-
-@st.cache_data(ttl=3600 * 12)
-def fetch_census_tract_data(
-    variables: list[str],
-    state: str = "42",
-    county: str = "101",
-    year: int = 2023,
-) -> pd.DataFrame:
-    """Fetch tract-level ACS data for a county."""
-    if not CENSUS_API_KEY:
-        return pd.DataFrame()
-    base = f"https://api.census.gov/data/{year}/acs/acs5"
-    get_vars = ",".join(["NAME"] + variables)
-    params = {
-        "get": get_vars,
-        "for": "tract:*",
-        "in": f"state:{state}&in=county:{county}",
-        "key": CENSUS_API_KEY,
-    }
+@st.cache_data(ttl=3600*12, show_spinner=False)
+def fetch_acs_tracts(variables, state="42", county="101", year=2023):
+    if not CENSUS_API_KEY: return pd.DataFrame()
     try:
-        r = requests.get(base, params=params, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        if len(data) < 2:
-            return pd.DataFrame()
-        df = pd.DataFrame(data[1:], columns=data[0])
-        return df
-    except Exception as e:
-        st.warning(f"Census tract error: {e}")
-        return pd.DataFrame()
+        r=requests.get(f"https://api.census.gov/data/{year}/acs/acs5?get=NAME,{','.join(variables)}&for=tract:*&in=state:{state}&in=county:{county}&key={CENSUS_API_KEY}", timeout=30)
+        if r.status_code!=200: return pd.DataFrame()
+        d=r.json(); return pd.DataFrame(d[1:],columns=d[0]) if len(d)>=2 else pd.DataFrame()
+    except Exception: return pd.DataFrame()
 
+@st.cache_data(ttl=3600*12, show_spinner=False)
+def fetch_multi_tracts(variables, cdict, year=2023):
+    frames=[]
+    for name,(st_,co) in cdict.items():
+        df=fetch_acs_tracts(variables,st_,co,year)
+        if not df.empty: df["county_label"]=name; frames.append(df)
+    return pd.concat(frames,ignore_index=True) if frames else pd.DataFrame()
 
-@st.cache_data(ttl=3600 * 12)
-def fetch_bls_qcew(
-    area_fips: str = "42101",
-    year: str = "2024",
-    qtr: str = "1",
-    industry: str = "1012",  # Construction
-) -> pd.DataFrame:
-    """Fetch QCEW data from BLS API (CSV files)."""
-    url = f"https://data.bls.gov/cew/data/api/{year}/{qtr}/area/{area_fips}.csv"
+@st.cache_data(ttl=3600*24, show_spinner="Loading tract boundaries…")
+def load_geojson(state_fips="42"):
+    try: import geopandas as gpd
+    except ImportError: return None
+    url=f"https://www2.census.gov/geo/tiger/GENZ2023/shp/cb_2023_{state_fips}_tract_500k.zip"
     try:
-        df = pd.read_csv(url, dtype=str, timeout=20)
-        return df
-    except Exception:
-        return pd.DataFrame()
+        r=requests.get(url,timeout=60)
+        if r.status_code!=200: return None
+        tmp=f"/tmp/tracts_{state_fips}"; os.makedirs(tmp,exist_ok=True)
+        with zipfile.ZipFile(io.BytesIO(r.content)) as z: z.extractall(tmp)
+        shp=[f for f in os.listdir(tmp) if f.endswith(".shp")][0]
+        gdf=gpd.read_file(f"{tmp}/{shp}")
+        gdf["GEOID"]=gdf["STATEFP"]+gdf["COUNTYFP"]+gdf["TRACTCE"]
+        return json.loads(gdf.to_json())
+    except Exception: return None
 
+@st.cache_data(ttl=3600*12, show_spinner=False)
+def fetch_qcew(area="42101",year="2024",qtr="1"):
+    try: return pd.read_csv(f"https://data.bls.gov/cew/data/api/{year}/{qtr}/area/{area}.csv",dtype=str,timeout=20)
+    except Exception: return pd.DataFrame()
 
-# ──────────────────────────────────────────────────────────────────────────────
-# HELPER FUNCTIONS
-# ──────────────────────────────────────────────────────────────────────────────
-
-def make_metric_card(label: str, value: str, delta: str = None, delta_color: str = "normal"):
-    """Render a styled metric card."""
-    st.metric(label=label, value=value, delta=delta, delta_color=delta_color)
-
-
-def format_number(n, decimals=1):
-    if pd.isna(n):
-        return "N/A"
-    if abs(n) >= 1e9:
-        return f"${n/1e9:,.{decimals}f}B"
-    if abs(n) >= 1e6:
-        return f"${n/1e6:,.{decimals}f}M"
-    if abs(n) >= 1e3:
-        return f"{n/1e3:,.{decimals}f}K"
-    return f"{n:,.{decimals}f}"
-
-
-def build_time_series_chart(
-    df: pd.DataFrame,
-    title: str,
-    y_label: str = "",
-    color: str = COLORS["gold"],
-    show_trend: bool = False,
-    y_format: str = None,
-):
-    """Build a clean time-series line chart."""
+# ── CHART HELPERS ──
+def lchart(df,title,yl="",color=C["gold"],trend=False,yp="",ys=""):
     if df.empty:
-        return go.Figure().update_layout(title=title, **CHART_LAYOUT)
+        fig=go.Figure(); fig.update_layout(**BL,title=dict(text=title,font=dict(size=16)))
+        fig.add_annotation(text="No data available",showarrow=False,font=dict(size=14,color=C["muted"])); return fig
+    r_,g_,b_=int(color[1:3],16),int(color[3:5],16),int(color[5:7],16)
+    fig=go.Figure()
+    fig.add_trace(go.Scatter(x=df["date"],y=df["value"],mode="lines",
+        line=dict(color=color,width=2.5),fill="tozeroy",fillcolor=f"rgba({r_},{g_},{b_},0.08)",
+        hovertemplate=f"<b>%{{x|%b %Y}}</b><br>{yl}: {yp}%{{y:,.1f}}{ys}<extra></extra>"))
+    if trend and len(df)>12:
+        s=df.sort_values("date")
+        fig.add_trace(go.Scatter(x=s["date"],y=s["value"].rolling(12,min_periods=6).mean(),
+            mode="lines",line=dict(color=C["muted"],width=1.5,dash="dot"),name="12-mo avg",hoverinfo="skip"))
+    ex={}
+    if yp=="$": ex["yaxis_tickprefix"]="$"
+    if ys=="%": ex["yaxis_ticksuffix"]="%"
+    fig.update_layout(**BL,title=dict(text=title,font=dict(size=16)),**ex); return fig
 
-    fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=df["date"],
-            y=df["value"],
-            mode="lines",
-            line=dict(color=color, width=2.5),
-            fill="tozeroy",
-            fillcolor=f"rgba({int(color[1:3],16)},{int(color[3:5],16)},{int(color[5:7],16)},0.08)",
-            hovertemplate=f"<b>%{{x|%b %Y}}</b><br>{y_label}: %{{y:,.1f}}<extra></extra>",
-        )
-    )
-    if show_trend and len(df) > 12:
-        df_sorted = df.sort_values("date")
-        rolling = df_sorted["value"].rolling(12, min_periods=6).mean()
-        fig.add_trace(
-            go.Scatter(
-                x=df_sorted["date"],
-                y=rolling,
-                mode="lines",
-                line=dict(color=COLORS["muted"], width=1.5, dash="dot"),
-                name="12-mo avg",
-                hoverinfo="skip",
-            )
-        )
-    layout_kwargs = {**CHART_LAYOUT, "title": dict(text=title, font=dict(size=16))}
-    if y_format:
-        layout_kwargs["yaxis"] = {**CHART_LAYOUT.get("yaxis", {}), "tickformat": y_format}
-    fig.update_layout(**layout_kwargs)
-    return fig
+def bchart(names,vals,title,color=C["gold"],horiz=False,yl="",yp=""):
+    fig=go.Figure()
+    if horiz: fig.add_trace(go.Bar(y=names,x=vals,orientation="h",marker_color=color,hovertemplate=f"<b>%{{y}}</b><br>{yl}: {yp}%{{x:,.1f}}<extra></extra>"))
+    else: fig.add_trace(go.Bar(x=names,y=vals,marker_color=color,hovertemplate=f"<b>%{{x}}</b><br>{yl}: {yp}%{{y:,.1f}}<extra></extra>"))
+    fig.update_layout(**BL,title=dict(text=title,font=dict(size=16))); return fig
 
+def compute_tract_metrics(df):
+    for col in TRACT_VARS: df[col]=pd.to_numeric(df[col],errors="coerce")
+    df["pop2534"]=df[["B01001_011E","B01001_012E","B01001_035E","B01001_036E"]].sum(axis=1)
+    df["pct2534"]=df["pop2534"]/df["B01003_001E"]*100
+    df["renter_pct"]=df["B25003_003E"]/df["B25003_001E"]*100
+    df["burden_pct"]=df[["B25070_008E","B25070_009E","B25070_010E","B25070_011E"]].sum(axis=1)/df["B25070_001E"]*100
+    df["r2i"]=(df["B25064_001E"]*12)/df["B19013_001E"]*100
+    df["unemp"]=df["B23025_005E"]/df["B23025_002E"]*100
+    return df
 
-def build_bar_chart(
-    names: list,
-    values: list,
-    title: str,
-    color: str = COLORS["gold"],
-    horizontal: bool = False,
-    y_label: str = "",
-):
-    """Build a clean bar chart."""
-    fig = go.Figure()
-    if horizontal:
-        fig.add_trace(
-            go.Bar(
-                y=names,
-                x=values,
-                orientation="h",
-                marker_color=color,
-                hovertemplate=f"<b>%{{y}}</b><br>{y_label}: %{{x:,.1f}}<extra></extra>",
-            )
-        )
-    else:
-        fig.add_trace(
-            go.Bar(
-                x=names,
-                y=values,
-                marker_color=color,
-                hovertemplate=f"<b>%{{x}}</b><br>{y_label}: %{{y:,.1f}}<extra></extra>",
-            )
-        )
-    fig.update_layout(**CHART_LAYOUT, title=dict(text=title, font=dict(size=16)))
-    return fig
-
+def compute_demand_score(df):
+    v=df.dropna(subset=["pct2534","B25064_001E","B19013_001E"]).copy()
+    v=v[(v["B01003_001E"]>200)&(v["pct2534"]<100)]
+    for s in ["pct2534","renter_pct"]:
+        mn,mx=v[s].min(),v[s].max()
+        v[f"{s}_n"]=((v[s]-mn)/(mx-mn)) if mx>mn else 0
+    v["score"]=(v["pct2534_n"]*0.5+v["renter_pct_n"]*0.3+(1-v["r2i"].clip(0,60)/60)*0.2)*100
+    return v
 
 # ──────────────────────────────────────────────────────────────────────────────
-# PAGE SETUP
+# PAGE SETUP & CSS
 # ──────────────────────────────────────────────────────────────────────────────
 
-st.set_page_config(
-    page_title="Lapstone Intel — Philadelphia Construction Dashboard",
-    page_icon="🏗️",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+st.set_page_config(page_title="Lapstone Intel — Philly Dashboard", page_icon="🏗️", layout="wide", initial_sidebar_state="expanded")
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&family=Space+Mono&display=swap');
+.stApp{font-family:'DM Sans',sans-serif}
+.dashboard-header{background:linear-gradient(135deg,#1A1D26,#0E1117);border:1px solid rgba(200,169,81,.2);border-radius:12px;padding:1.5rem 2rem;margin-bottom:1.5rem}
+.dashboard-header h1{color:#C8A951;font-size:2rem;font-weight:700;margin:0;letter-spacing:-.5px}
+.dashboard-header p{color:#7F8C9B;font-size:.95rem;margin:.25rem 0 0}
+[data-testid="stMetric"]{background:#1A1D26;border:1px solid rgba(255,255,255,.06);border-radius:10px;padding:1rem 1.25rem}
+[data-testid="stMetricLabel"]{color:#7F8C9B!important;font-size:.8rem!important;text-transform:uppercase;letter-spacing:.5px}
+[data-testid="stMetricValue"]{color:#E8E8E8!important;font-family:'Space Mono',monospace!important;font-size:1.6rem!important}
+[data-testid="stMetricDelta"]{font-family:'Space Mono',monospace!important}
+.stTabs [data-baseweb="tab-list"]{gap:.5rem}
+.stTabs [data-baseweb="tab"]{border-radius:8px 8px 0 0;padding:.6rem 1.2rem;color:#7F8C9B}
+.stTabs [aria-selected="true"]{color:#C8A951!important;border-bottom:2px solid #C8A951}
+section[data-testid="stSidebar"]{background:#12151C;border-right:1px solid rgba(255,255,255,.06)}
+.section-label{color:#C8A951;font-size:.75rem;text-transform:uppercase;letter-spacing:1.5px;font-weight:700;margin:2rem 0 .5rem;padding-bottom:.3rem;border-bottom:1px solid rgba(200,169,81,.15)}
+.info-box{background:rgba(200,169,81,.06);border-left:3px solid #C8A951;border-radius:0 8px 8px 0;padding:.75rem 1rem;font-size:.85rem;color:#A8ADB5;margin:.5rem 0}
+#MainMenu{visibility:hidden}footer{visibility:hidden}header{visibility:hidden}
+div.block-container{padding-top:1.5rem}
+.stPlotlyChart{border:1px solid rgba(255,255,255,.04);border-radius:10px;overflow:hidden}
+</style>""", unsafe_allow_html=True)
 
-# Custom CSS
-st.markdown(
-    """
-    <style>
-    @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&family=Space+Mono&display=swap');
-
-    .stApp {
-        font-family: 'DM Sans', sans-serif;
-    }
-
-    /* Header banner */
-    .dashboard-header {
-        background: linear-gradient(135deg, #1A1D26 0%, #0E1117 100%);
-        border: 1px solid rgba(200, 169, 81, 0.2);
-        border-radius: 12px;
-        padding: 1.5rem 2rem;
-        margin-bottom: 1.5rem;
-    }
-    .dashboard-header h1 {
-        color: #C8A951;
-        font-size: 2rem;
-        font-weight: 700;
-        margin: 0;
-        letter-spacing: -0.5px;
-    }
-    .dashboard-header p {
-        color: #7F8C9B;
-        font-size: 0.95rem;
-        margin: 0.25rem 0 0 0;
-    }
-
-    /* Metric cards */
-    [data-testid="stMetric"] {
-        background: #1A1D26;
-        border: 1px solid rgba(255,255,255,0.06);
-        border-radius: 10px;
-        padding: 1rem 1.25rem;
-    }
-    [data-testid="stMetricLabel"] {
-        color: #7F8C9B !important;
-        font-size: 0.8rem !important;
-        text-transform: uppercase;
-        letter-spacing: 0.5px;
-    }
-    [data-testid="stMetricValue"] {
-        color: #E8E8E8 !important;
-        font-family: 'Space Mono', monospace !important;
-        font-size: 1.6rem !important;
-    }
-    [data-testid="stMetricDelta"] {
-        font-family: 'Space Mono', monospace !important;
-    }
-
-    /* Tab styling */
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 0.5rem;
-    }
-    .stTabs [data-baseweb="tab"] {
-        border-radius: 8px 8px 0 0;
-        padding: 0.6rem 1.2rem;
-        color: #7F8C9B;
-    }
-    .stTabs [aria-selected="true"] {
-        color: #C8A951 !important;
-        border-bottom: 2px solid #C8A951;
-    }
-
-    /* Sidebar */
-    section[data-testid="stSidebar"] {
-        background: #12151C;
-        border-right: 1px solid rgba(255,255,255,0.06);
-    }
-    section[data-testid="stSidebar"] .stMarkdown h1,
-    section[data-testid="stSidebar"] .stMarkdown h2,
-    section[data-testid="stSidebar"] .stMarkdown h3 {
-        color: #C8A951;
-    }
-
-    /* Section dividers */
-    .section-label {
-        color: #C8A951;
-        font-size: 0.75rem;
-        text-transform: uppercase;
-        letter-spacing: 1.5px;
-        font-weight: 700;
-        margin: 2rem 0 0.5rem 0;
-        padding-bottom: 0.3rem;
-        border-bottom: 1px solid rgba(200,169,81,0.15);
-    }
-
-    /* Info boxes */
-    .info-box {
-        background: rgba(200,169,81,0.06);
-        border-left: 3px solid #C8A951;
-        border-radius: 0 8px 8px 0;
-        padding: 0.75rem 1rem;
-        font-size: 0.85rem;
-        color: #A8ADB5;
-        margin: 0.5rem 0;
-    }
-
-    /* Hide default streamlit elements */
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
-    header {visibility: hidden;}
-
-    div.block-container {
-        padding-top: 1.5rem;
-    }
-
-    /* Plotly chart containers */
-    .stPlotlyChart {
-        border: 1px solid rgba(255,255,255,0.04);
-        border-radius: 10px;
-        overflow: hidden;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# SIDEBAR
-# ──────────────────────────────────────────────────────────────────────────────
-
+# ── SIDEBAR ──
 with st.sidebar:
     st.markdown("### 🏗️ Lapstone Intel")
-    st.markdown(
-        '<p style="color:#7F8C9B; font-size:0.85rem;">Philadelphia Construction & Real Estate Intelligence</p>',
-        unsafe_allow_html=True,
-    )
+    st.markdown('<p style="color:#7F8C9B;font-size:.85rem;">Philadelphia Construction & Real Estate Intelligence</p>', unsafe_allow_html=True)
     st.divider()
-
-    # API Key Management
     st.markdown('<div class="section-label">Data Sources</div>', unsafe_allow_html=True)
-
     if not FRED_API_KEY:
-        fred_key_input = st.text_input(
-            "FRED API Key",
-            type="password",
-            help="Get a free key at https://fred.stlouisfed.org/docs/api/api_key.html",
-        )
-        if fred_key_input:
-            FRED_API_KEY = fred_key_input
-            os.environ["FRED_API_KEY"] = fred_key_input
-            st.rerun()
-    else:
-        st.success("✓ FRED API connected", icon="✅")
-
+        fi=st.text_input("FRED API Key",type="password",help="Free at https://fred.stlouisfed.org/docs/api/api_key.html")
+        if fi: FRED_API_KEY=fi; os.environ["FRED_API_KEY"]=fi; st.rerun()
+    else: st.success("✓ FRED API connected")
     if not CENSUS_API_KEY:
-        census_key_input = st.text_input(
-            "Census API Key",
-            type="password",
-            help="Get a free key at https://api.census.gov/data/key_signup.html",
-        )
-        if census_key_input:
-            CENSUS_API_KEY = census_key_input
-            os.environ["CENSUS_API_KEY"] = census_key_input
-            st.rerun()
-    else:
-        st.success("✓ Census API connected", icon="✅")
-
+        ci=st.text_input("Census API Key",type="password",help="Free at https://api.census.gov/data/key_signup.html")
+        if ci: CENSUS_API_KEY=ci; os.environ["CENSUS_API_KEY"]=ci; st.rerun()
+    else: st.success("✓ Census API connected")
     st.divider()
-
-    # Date range
     st.markdown('<div class="section-label">Time Range</div>', unsafe_allow_html=True)
-    start_year = st.slider("Start year", 2010, 2024, 2015)
-    start_date = f"{start_year}-01-01"
-
+    start_year=st.slider("Start year",2010,2024,2015)
+    start_date=f"{start_year}-01-01"
     st.divider()
-
-    # County selection for comparisons
     st.markdown('<div class="section-label">Regional Comparison</div>', unsafe_allow_html=True)
-    selected_counties = st.multiselect(
-        "Compare counties",
-        options=list(COUNTY_FIPS.keys()),
-        default=["Philadelphia", "Montgomery", "Bucks", "Berks (Reading)"],
-    )
-
+    sel_counties=st.multiselect("Compare counties",list(COUNTY_FIPS.keys()),default=["Philadelphia","Montgomery","Bucks","Berks (Reading)","Delaware"])
     st.divider()
+    st.markdown('<div style="color:#5A6270;font-size:.75rem;margin-top:1rem"><b>Data Sources</b><br>• FRED • Census ACS • BLS QCEW<br><br>Built for <a href="https://www.lapstonellc.com" target="_blank" style="color:#C8A951;">Lapstone LLC</a></div>', unsafe_allow_html=True)
 
-    st.markdown(
-        """
-        <div style="color:#5A6270; font-size:0.75rem; margin-top:1rem;">
-        <b>Data Sources</b><br>
-        • Federal Reserve (FRED)<br>
-        • U.S. Census Bureau (ACS 5-Year)<br>
-        • Bureau of Labor Statistics (QCEW)<br><br>
-        Built for <a href="https://www.lapstonellc.com" target="_blank" style="color:#C8A951;">Lapstone LLC</a>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+# ── HEADER ──
+st.markdown('<div class="dashboard-header"><h1>Philadelphia Metro Intelligence</h1><p>Construction economy, rental demand, and demographic analytics for the greater Philadelphia region</p></div>', unsafe_allow_html=True)
 
+# ── PREFETCH FRED ──
+fd={}
+if FRED_API_KEY:
+    with st.spinner("Loading FRED data…"):
+        for k,sid in FRED_SERIES.items(): fd[k]=fetch_fred(sid,start_date)
+sel_fips={k:v for k,v in COUNTY_FIPS.items() if k in sel_counties}
 
-# ──────────────────────────────────────────────────────────────────────────────
-# HEADER
-# ──────────────────────────────────────────────────────────────────────────────
-
-st.markdown(
-    """
-    <div class="dashboard-header">
-        <h1>Philadelphia Metro Intelligence</h1>
-        <p>Construction economy, rental demand, and demographic analytics for the greater Philadelphia region</p>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# MAIN TABS
-# ──────────────────────────────────────────────────────────────────────────────
-
-tab_overview, tab_construction, tab_rental, tab_demographics, tab_regional = st.tabs(
-    ["📊 Overview", "🏗️ Construction", "🏠 Rental Demand", "👥 Demographics", "🗺️ Regional"]
-)
-
+# ── TABS ──
+t_ov,t_con,t_rent,t_maps,t_demo,t_reg=st.tabs(["📊 Overview","🏗️ Construction","🏠 Rental Demand","🗺️ Tract Maps","👥 Demographics","📍 Regional"])
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 1: OVERVIEW
 # ══════════════════════════════════════════════════════════════════════════════
-
-with tab_overview:
-    if not FRED_API_KEY:
-        st.info(
-            "👈 Enter your free **FRED API key** in the sidebar to load live economic data. "
-            "Get one at [fred.stlouisfed.org](https://fred.stlouisfed.org/docs/api/api_key.html)"
-        )
-
-    # Key metrics row
-    st.markdown('<div class="section-label">Key Indicators — Latest Available</div>', unsafe_allow_html=True)
-
-    col1, col2, col3, col4, col5 = st.columns(5)
-
-    # Unemployment
-    unemp_df = fetch_fred_series("PAPHIL5URN", start_date)
-    with col1:
-        if not unemp_df.empty:
-            latest = unemp_df.iloc[-1]["value"]
-            prev = unemp_df.iloc[-13]["value"] if len(unemp_df) > 13 else None
-            delta = f"{latest - prev:+.1f}pp YoY" if prev else None
-            make_metric_card("Unemployment Rate", f"{latest:.1f}%", delta, "inverse")
-        else:
-            make_metric_card("Unemployment Rate", "—")
-
-    # Construction Employment
-    const_emp_df = fetch_fred_series("PHIL942CONS", start_date)
-    with col2:
-        if not const_emp_df.empty:
-            latest = const_emp_df.iloc[-1]["value"]
-            prev_yr = const_emp_df.iloc[-13]["value"] if len(const_emp_df) > 13 else None
-            delta = f"{((latest/prev_yr)-1)*100:+.1f}% YoY" if prev_yr else None
-            make_metric_card("Construction Jobs (MSA)", f"{latest:,.0f}K", delta)
-        else:
-            make_metric_card("Construction Jobs", "—")
-
-    # Building Permits
-    permits_df = fetch_fred_series("PHIL942BPPRIV", start_date)
-    with col3:
-        if not permits_df.empty:
-            # Sum last 12 months vs prior 12
-            recent_12 = permits_df.tail(12)["value"].sum()
-            prior_12 = permits_df.iloc[-24:-12]["value"].sum() if len(permits_df) >= 24 else None
-            delta = f"{((recent_12/prior_12)-1)*100:+.1f}% YoY" if prior_12 and prior_12 > 0 else None
-            make_metric_card("Permits (12-mo, MSA)", f"{recent_12:,.0f}", delta)
-        else:
-            make_metric_card("Building Permits", "—")
-
-    # GDP
-    gdp_df = fetch_fred_series("NGMP37964", start_date)
-    with col4:
-        if not gdp_df.empty:
-            latest = gdp_df.iloc[-1]["value"]
-            prev = gdp_df.iloc[-2]["value"] if len(gdp_df) > 1 else None
-            delta = f"{((latest/prev)-1)*100:+.1f}% YoY" if prev else None
-            make_metric_card("GDP (Philly MSA)", format_number(latest * 1e6), delta)
-        else:
-            make_metric_card("GDP", "—")
-
-    # Homeownership Rate
-    homeown_df = fetch_fred_series("HOWNRATEACS042101", "2010-01-01")
-    with col5:
-        if not homeown_df.empty:
-            latest = homeown_df.iloc[-1]["value"]
-            prev = homeown_df.iloc[-2]["value"] if len(homeown_df) > 1 else None
-            delta = f"{latest - prev:+.1f}pp" if prev else None
-            make_metric_card("Homeownership Rate", f"{latest:.1f}%", delta, "off")
-        else:
-            make_metric_card("Homeownership Rate", "—")
-
+with t_ov:
+    if not FRED_API_KEY: st.info("👈 Enter your **FRED API key** in the sidebar. Free at [fred.stlouisfed.org](https://fred.stlouisfed.org/docs/api/api_key.html)")
+    st.markdown('<div class="section-label">Key Indicators</div>',unsafe_allow_html=True)
+    def slat(k):
+        df=fd.get(k,pd.DataFrame())
+        if df.empty: return None,None
+        la=df.iloc[-1]["value"]; pr=df.iloc[-13]["value"] if len(df)>13 else (df.iloc[-2]["value"] if len(df)>1 else None)
+        return la,pr
+    c1,c2,c3,c4,c5=st.columns(5)
+    with c1:
+        v,p=slat("unemp_philly"); d=f"{v-p:+.1f}pp YoY" if v is not None and p is not None else None
+        st.metric("Unemployment Rate",f"{v:.1f}%" if v else "—",d,delta_color="inverse")
+    with c2:
+        v,p=slat("const_emp"); d=f"{((v/p)-1)*100:+.1f}% YoY" if v and p else None
+        st.metric("Construction Jobs (MSA)",f"{v:,.0f}K" if v else "—",d)
+    with c3:
+        dp=fd.get("permits_tot",pd.DataFrame())
+        if not dp.empty and len(dp)>=12:
+            r12=dp.tail(12)["value"].sum(); p12=dp.iloc[-24:-12]["value"].sum() if len(dp)>=24 else None
+            d=f"{((r12/p12)-1)*100:+.1f}% YoY" if p12 and p12>0 else None
+            st.metric("Permits (12-mo)",f"{r12:,.0f}",d)
+        else: st.metric("Permits","—")
+    with c4:
+        v,p=slat("gdp"); d=f"{((v/p)-1)*100:+.1f}% YoY" if v and p else None
+        def fnum(n):
+            if n is None: return "—"
+            if n>=1e3: return f"${n/1e3:,.0f}B"
+            return f"${n:,.0f}M"
+        st.metric("GDP (Philly MSA)",fnum(v),d)
+    with c5:
+        v,p=slat("homeown"); d=f"{v-p:+.1f}pp" if v is not None and p is not None else None
+        st.metric("Homeownership",f"{v:.1f}%" if v else "—",d,delta_color="off")
     st.markdown("")
-
-    # Time-series charts
-    col_left, col_right = st.columns(2)
-
-    with col_left:
-        fig = build_time_series_chart(
-            unemp_df,
-            "Unemployment Rate — Philadelphia County",
-            y_label="Rate",
-            color=COLORS["coral"],
-            show_trend=True,
-            y_format=".1f",
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-    with col_right:
-        fig = build_time_series_chart(
-            const_emp_df,
-            "Construction Employment — Philadelphia MSA (Thousands)",
-            y_label="Employees (K)",
-            color=COLORS["teal"],
-            show_trend=True,
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-    col_left2, col_right2 = st.columns(2)
-
-    with col_left2:
-        fig = build_time_series_chart(
-            permits_df,
-            "Building Permits Issued — Philadelphia MSA (Monthly)",
-            y_label="Permits",
-            color=COLORS["gold"],
-            show_trend=True,
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-    with col_right2:
-        fig = build_time_series_chart(
-            gdp_df,
-            "Gross Domestic Product — Philadelphia MSA ($M)",
-            y_label="GDP ($M)",
-            color=COLORS["lavender"],
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-    # Shelter CPI
-    st.markdown('<div class="section-label">Inflation Tracking</div>', unsafe_allow_html=True)
-
-    col_cpi1, col_cpi2 = st.columns(2)
-    shelter_cpi = fetch_fred_series("CUURS12ASAH", start_date)
-    all_cpi = fetch_fred_series("CUURS12ASA0", start_date)
-
-    with col_cpi1:
-        if not shelter_cpi.empty and not all_cpi.empty:
-            # Calculate YoY % change
-            for df_cpi in [shelter_cpi, all_cpi]:
-                df_cpi_sorted = df_cpi.sort_values("date")
-                df_cpi["yoy"] = df_cpi_sorted["value"].pct_change(12) * 100
-
-            fig = go.Figure()
-            fig.add_trace(
-                go.Scatter(
-                    x=shelter_cpi["date"],
-                    y=shelter_cpi["yoy"],
-                    mode="lines",
-                    name="Shelter CPI (YoY %)",
-                    line=dict(color=COLORS["coral"], width=2.5),
-                )
-            )
-            fig.add_trace(
-                go.Scatter(
-                    x=all_cpi["date"],
-                    y=all_cpi["yoy"],
-                    mode="lines",
-                    name="All Items CPI (YoY %)",
-                    line=dict(color=COLORS["steel"], width=2),
-                )
-            )
-            fig.update_layout(
-                **CHART_LAYOUT,
-                title=dict(text="Philadelphia MSA — CPI Year-over-Year Change (%)", font=dict(size=16)),
-                yaxis_ticksuffix="%",
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-    with col_cpi2:
-        median_income_df = fetch_fred_series("MHIPA42101A052NCEN", "2010-01-01")
-        fig = build_time_series_chart(
-            median_income_df,
-            "Median Household Income — Philadelphia County",
-            y_label="Income",
-            color=COLORS["sky"],
-            y_format="$,.0f",
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
+    cl,cr=st.columns(2)
+    with cl: st.plotly_chart(lchart(fd.get("unemp_philly",pd.DataFrame()),"Unemployment — Philadelphia County","Rate",C["coral"],True,ys="%"),use_container_width=True)
+    with cr: st.plotly_chart(lchart(fd.get("const_emp",pd.DataFrame()),"Construction Employment — Philly MSA (K)","Jobs",C["teal"],True),use_container_width=True)
+    cl2,cr2=st.columns(2)
+    with cl2: st.plotly_chart(lchart(fd.get("permits_tot",pd.DataFrame()),"Building Permits — Philly MSA (Monthly)","Permits",C["gold"],True),use_container_width=True)
+    with cr2: st.plotly_chart(lchart(fd.get("gdp",pd.DataFrame()),"GDP — Philly MSA ($M)","GDP",C["lavender"],yp="$"),use_container_width=True)
+    # CPI
+    st.markdown('<div class="section-label">Inflation & Income</div>',unsafe_allow_html=True)
+    cc1,cc2=st.columns(2)
+    with cc1:
+        sh=fd.get("cpi_shelter",pd.DataFrame()); al=fd.get("cpi_all",pd.DataFrame())
+        if not sh.empty and not al.empty:
+            s=sh.sort_values("date").copy(); a=al.sort_values("date").copy()
+            s["yoy"]=s["value"].pct_change(12)*100; a["yoy"]=a["value"].pct_change(12)*100
+            fig=go.Figure()
+            fig.add_trace(go.Scatter(x=s["date"],y=s["yoy"],mode="lines",name="Shelter CPI YoY%",line=dict(color=C["coral"],width=2.5)))
+            fig.add_trace(go.Scatter(x=a["date"],y=a["yoy"],mode="lines",name="All Items CPI YoY%",line=dict(color=C["steel"],width=2)))
+            fig.update_layout(**BL,title=dict(text="Philly MSA — CPI Year-over-Year (%)",font=dict(size=16)),yaxis_ticksuffix="%")
+            st.plotly_chart(fig,use_container_width=True)
+    with cc2: st.plotly_chart(lchart(fd.get("med_income",pd.DataFrame()),"Median HH Income — Philly County","Income",C["sky"],yp="$"),use_container_width=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 2: CONSTRUCTION
 # ══════════════════════════════════════════════════════════════════════════════
-
-with tab_construction:
-    st.markdown('<div class="section-label">Construction Sector Deep Dive</div>', unsafe_allow_html=True)
-
-    col1, col2 = st.columns(2)
-
-    # Permits: 1-unit vs total
-    permits_1unit = fetch_fred_series("PHIL942BP1FH", start_date)
-
-    with col1:
-        if not permits_df.empty and not permits_1unit.empty:
-            fig = go.Figure()
-            fig.add_trace(
-                go.Scatter(
-                    x=permits_df["date"],
-                    y=permits_df["value"],
-                    mode="lines",
-                    name="Total Permits",
-                    line=dict(color=COLORS["gold"], width=2.5),
-                )
-            )
-            fig.add_trace(
-                go.Scatter(
-                    x=permits_1unit["date"],
-                    y=permits_1unit["value"],
-                    mode="lines",
-                    name="Single-Family (1-Unit)",
-                    line=dict(color=COLORS["teal"], width=2),
-                )
-            )
-            # Multi-family = total - 1-unit
-            merged = permits_df.merge(permits_1unit, on="date", suffixes=("_total", "_1unit"))
-            merged["multi"] = merged["value_total"] - merged["value_1unit"]
-            fig.add_trace(
-                go.Scatter(
-                    x=merged["date"],
-                    y=merged["multi"],
-                    mode="lines",
-                    name="Multi-Family (2+ Unit)",
-                    line=dict(color=COLORS["coral"], width=2),
-                )
-            )
-            fig.update_layout(
-                **CHART_LAYOUT,
-                title=dict(text="Building Permits by Structure Type — Philadelphia MSA", font=dict(size=16)),
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-    with col2:
-        # Construction employment vs total nonfarm
-        nonfarm_df = fetch_fred_series("PHIL942NA", start_date)
-        if not const_emp_df.empty and not nonfarm_df.empty:
-            # Calculate construction as % of total
-            merged_emp = const_emp_df.merge(nonfarm_df, on="date", suffixes=("_const", "_total"))
-            merged_emp["pct"] = (merged_emp["value_const"] / merged_emp["value_total"]) * 100
-
-            fig = go.Figure()
-            fig.add_trace(
-                go.Scatter(
-                    x=merged_emp["date"],
-                    y=merged_emp["pct"],
-                    mode="lines",
-                    line=dict(color=COLORS["gold"], width=2.5),
-                    fill="tozeroy",
-                    fillcolor="rgba(200,169,81,0.08)",
-                    hovertemplate="<b>%{x|%b %Y}</b><br>Construction share: %{y:.2f}%<extra></extra>",
-                )
-            )
-            fig.update_layout(
-                **CHART_LAYOUT,
-                title=dict(
-                    text="Construction as % of Total Employment — Philadelphia MSA",
-                    font=dict(size=16),
-                ),
-                yaxis_ticksuffix="%",
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-    # QCEW Construction data
-    st.markdown('<div class="section-label">Construction Industry Breakdown (BLS QCEW)</div>', unsafe_allow_html=True)
-
-    qcew_years = ["2024", "2023", "2022", "2021", "2020"]
-    selected_qcew_year = st.selectbox("QCEW Year", qcew_years, index=0)
-
-    qcew_data = fetch_bls_qcew(area_fips="42101", year=selected_qcew_year, qtr="1")
-
-    if not qcew_data.empty and "industry_code" in qcew_data.columns:
-        # Filter to construction-related NAICS codes
-        construction_codes = {
-            "1012": "Construction (Total)",
-            "1013": "Construction of Buildings",
-            "1014": "Heavy & Civil Engineering",
-            "1015": "Specialty Trade Contractors",
-        }
-        const_rows = qcew_data[
-            (qcew_data["industry_code"].isin(construction_codes.keys()))
-            & (qcew_data["own_code"] == "5")  # Private
-        ].copy()
-
-        if not const_rows.empty:
-            for col_name in ["annual_avg_emplvl", "avg_annual_pay", "annual_avg_estabs_count"]:
-                if col_name in const_rows.columns:
-                    const_rows[col_name] = pd.to_numeric(const_rows[col_name], errors="coerce")
-
-            const_rows["industry_label"] = const_rows["industry_code"].map(construction_codes)
-
-            col_q1, col_q2, col_q3 = st.columns(3)
-            total_row = const_rows[const_rows["industry_code"] == "1012"]
-
-            if not total_row.empty:
-                with col_q1:
-                    val = total_row.iloc[0].get("annual_avg_emplvl", 0)
-                    make_metric_card("Construction Employment", f"{val:,.0f}" if pd.notna(val) else "N/A")
-                with col_q2:
-                    val = total_row.iloc[0].get("avg_annual_pay", 0)
-                    make_metric_card("Avg Annual Pay", f"${val:,.0f}" if pd.notna(val) else "N/A")
-                with col_q3:
-                    val = total_row.iloc[0].get("annual_avg_estabs_count", 0)
-                    make_metric_card("Establishments", f"{val:,.0f}" if pd.notna(val) else "N/A")
-
-            # Sub-industry breakdown
-            sub_rows = const_rows[const_rows["industry_code"] != "1012"]
-            if not sub_rows.empty and "annual_avg_emplvl" in sub_rows.columns:
-                col_s1, col_s2 = st.columns(2)
-                with col_s1:
-                    fig = build_bar_chart(
-                        sub_rows["industry_label"].tolist(),
-                        sub_rows["annual_avg_emplvl"].tolist(),
-                        f"Construction Employment by Sub-Industry — {selected_qcew_year}",
-                        color=COLORS["teal"],
-                        y_label="Employees",
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
-                with col_s2:
-                    if "avg_annual_pay" in sub_rows.columns:
-                        fig = build_bar_chart(
-                            sub_rows["industry_label"].tolist(),
-                            sub_rows["avg_annual_pay"].tolist(),
-                            f"Avg Annual Pay by Sub-Industry — {selected_qcew_year}",
-                            color=COLORS["gold"],
-                            y_label="Avg Pay ($)",
-                        )
-                        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.markdown(
-            '<div class="info-box">QCEW data loads directly from BLS — no API key required. '
-            "If data doesn't appear, the selected year/quarter may not be published yet.</div>",
-            unsafe_allow_html=True,
-        )
-
-    # Permit trends — annual aggregation
-    st.markdown('<div class="section-label">Annual Permit Volume Trend</div>', unsafe_allow_html=True)
-
-    if not permits_df.empty:
-        annual = permits_df.copy()
-        annual["year"] = annual["date"].dt.year
-        annual_sum = annual.groupby("year")["value"].sum().reset_index()
-        annual_sum = annual_sum[annual_sum["year"] >= start_year]
-
-        fig = go.Figure()
-        fig.add_trace(
-            go.Bar(
-                x=annual_sum["year"],
-                y=annual_sum["value"],
-                marker_color=[
-                    COLORS["gold"] if y == annual_sum["year"].max() else COLORS["slate"]
-                    for y in annual_sum["year"]
-                ],
-                hovertemplate="<b>%{x}</b><br>Total Permits: %{y:,.0f}<extra></extra>",
-            )
-        )
-        fig.update_layout(
-            **CHART_LAYOUT,
-            title=dict(text="Annual Building Permits — Philadelphia MSA", font=dict(size=16)),
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
+with t_con:
+    st.markdown('<div class="section-label">Construction Deep Dive</div>',unsafe_allow_html=True)
+    co1,co2=st.columns(2)
+    with co1:
+        tot=fd.get("permits_tot",pd.DataFrame()); u1=fd.get("permits_1u",pd.DataFrame())
+        if not tot.empty and not u1.empty:
+            fig=go.Figure()
+            fig.add_trace(go.Scatter(x=tot["date"],y=tot["value"],mode="lines",name="Total",line=dict(color=C["gold"],width=2.5)))
+            fig.add_trace(go.Scatter(x=u1["date"],y=u1["value"],mode="lines",name="Single-Family",line=dict(color=C["teal"],width=2)))
+            m=tot.merge(u1,on="date",suffixes=("_t","_1")); m["multi"]=m["value_t"]-m["value_1"]
+            fig.add_trace(go.Scatter(x=m["date"],y=m["multi"],mode="lines",name="Multi-Family (2+)",line=dict(color=C["coral"],width=2)))
+            fig.update_layout(**BL,title=dict(text="Permits by Structure Type — Philly MSA",font=dict(size=16)))
+            st.plotly_chart(fig,use_container_width=True)
+    with co2:
+        ce=fd.get("const_emp",pd.DataFrame()); nf=fd.get("nonfarm",pd.DataFrame())
+        if not ce.empty and not nf.empty:
+            m=ce.merge(nf,on="date",suffixes=("_c","_t")); m["pct"]=(m["value_c"]/m["value_t"])*100
+            fig=go.Figure(go.Scatter(x=m["date"],y=m["pct"],mode="lines",line=dict(color=C["gold"],width=2.5),
+                fill="tozeroy",fillcolor="rgba(200,169,81,0.08)",hovertemplate="<b>%{x|%b %Y}</b><br>%{y:.2f}%<extra></extra>"))
+            fig.update_layout(**BL,title=dict(text="Construction % of Total Employment",font=dict(size=16)),yaxis_ticksuffix="%")
+            st.plotly_chart(fig,use_container_width=True)
+    # QCEW
+    st.markdown('<div class="section-label">BLS QCEW — Construction Industry</div>',unsafe_allow_html=True)
+    qy=st.selectbox("Year",["2024","2023","2022","2021","2020"],index=0)
+    qcew=fetch_qcew("42101",qy,"1")
+    if not qcew.empty and "industry_code" in qcew.columns:
+        codes={"1012":"Construction (Total)","1013":"Construction of Buildings","1014":"Heavy & Civil Engineering","1015":"Specialty Trade Contractors"}
+        rows=qcew[(qcew["industry_code"].isin(codes))&(qcew["own_code"]=="5")].copy()
+        if not rows.empty:
+            for c_ in ["annual_avg_emplvl","avg_annual_pay","annual_avg_estabs_count"]:
+                if c_ in rows.columns: rows[c_]=pd.to_numeric(rows[c_],errors="coerce")
+            rows["label"]=rows["industry_code"].map(codes)
+            tot_r=rows[rows["industry_code"]=="1012"]
+            if not tot_r.empty:
+                mc1,mc2,mc3=st.columns(3)
+                with mc1: st.metric("Employment",f"{tot_r.iloc[0].get('annual_avg_emplvl',0):,.0f}")
+                with mc2: st.metric("Avg Annual Pay",f"${tot_r.iloc[0].get('avg_annual_pay',0):,.0f}")
+                with mc3: st.metric("Establishments",f"{tot_r.iloc[0].get('annual_avg_estabs_count',0):,.0f}")
+            sub=rows[rows["industry_code"]!="1012"]
+            if not sub.empty:
+                sc1,sc2=st.columns(2)
+                with sc1: st.plotly_chart(bchart(sub["label"].tolist(),sub["annual_avg_emplvl"].tolist(),f"Employment — {qy}",C["teal"],yl="Employees"),use_container_width=True)
+                with sc2:
+                    if "avg_annual_pay" in sub.columns: st.plotly_chart(bchart(sub["label"].tolist(),sub["avg_annual_pay"].tolist(),f"Avg Pay — {qy}",C["gold"],yl="Pay",yp="$"),use_container_width=True)
+    # Annual permits
+    st.markdown('<div class="section-label">Annual Permit Trend</div>',unsafe_allow_html=True)
+    pm=fd.get("permits_tot",pd.DataFrame())
+    if not pm.empty:
+        a=pm.copy(); a["yr"]=a["date"].dt.year; asum=a.groupby("yr")["value"].sum().reset_index()
+        asum=asum[asum["yr"]>=start_year]
+        fig=go.Figure(go.Bar(x=asum["yr"],y=asum["value"],
+            marker_color=[C["gold"] if y==asum["yr"].max() else C["slate"] for y in asum["yr"]],
+            hovertemplate="<b>%{x}</b><br>%{y:,.0f}<extra></extra>"))
+        fig.update_layout(**BL,title=dict(text="Annual Permits — Philly MSA",font=dict(size=16)))
+        st.plotly_chart(fig,use_container_width=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 3: RENTAL DEMAND INTELLIGENCE
+# TAB 3: RENTAL DEMAND
 # ══════════════════════════════════════════════════════════════════════════════
-
-with tab_rental:
-    st.markdown('<div class="section-label">Rental Market — Young Professional Demand Signals</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="info-box">'
-        "<b>Target Renter Avatar:</b> Young professionals (25–34), employed, responsible renters who "
-        "can't yet afford to buy. This section identifies where these renters cluster and tracks "
-        "affordability dynamics."
-        "</div>",
-        unsafe_allow_html=True,
-    )
-
-    if not CENSUS_API_KEY:
-        st.info(
-            "👈 Enter your free **Census API key** in the sidebar to load demographic data. "
-            "Get one at [api.census.gov](https://api.census.gov/data/key_signup.html)"
-        )
+with t_rent:
+    st.markdown('<div class="section-label">Rental Market — Young Professional Demand</div>',unsafe_allow_html=True)
+    st.markdown('<div class="info-box"><b>Target Avatar:</b> Young professionals (25–34), employed, responsible renters. This section identifies where they cluster and tracks affordability.</div>',unsafe_allow_html=True)
+    if not CENSUS_API_KEY: st.info("👈 Enter your Census API key in the sidebar.")
     else:
-        # ── County-level comparison: Rent burden, young adults, income ──
-        county_vars = [
-            "B01001_011E",  # Male 25-29
-            "B01001_012E",  # Male 30-34
-            "B01001_035E",  # Female 25-29
-            "B01001_036E",  # Female 30-34
-            "B01003_001E",  # Total population
-            "B25064_001E",  # Median gross rent
-            "B19013_001E",  # Median household income
-            "B25003_001E",  # Total tenure
-            "B25003_003E",  # Renter-occupied
-            "B25070_007E",  # Rent 25-29.9% of income
-            "B25070_008E",  # Rent 30-34.9%
-            "B25070_009E",  # Rent 35-39.9%
-            "B25070_010E",  # Rent 40-49.9%
-            "B25070_011E",  # Rent 50%+
-            "B25070_001E",  # Total rent burden universe
-        ]
-
-        selected_fips = {k: v for k, v in COUNTY_FIPS.items() if k in selected_counties}
-        county_data = fetch_census_acs_county_multi(county_vars, selected_fips)
-
-        if not county_data.empty:
-            # Compute metrics
-            for col in county_vars:
-                county_data[col] = pd.to_numeric(county_data[col], errors="coerce")
-
-            county_data["pop_25_34"] = (
-                county_data["B01001_011E"]
-                + county_data["B01001_012E"]
-                + county_data["B01001_035E"]
-                + county_data["B01001_036E"]
-            )
-            county_data["pop_25_34_pct"] = county_data["pop_25_34"] / county_data["B01003_001E"] * 100
-            county_data["renter_pct"] = county_data["B25003_003E"] / county_data["B25003_001E"] * 100
-            county_data["rent_burdened"] = (
-                county_data["B25070_008E"]
-                + county_data["B25070_009E"]
-                + county_data["B25070_010E"]
-                + county_data["B25070_011E"]
-            )
-            county_data["rent_burden_pct"] = county_data["rent_burdened"] / county_data["B25070_001E"] * 100
-
-            # Summary metrics
-            philly_row = county_data[county_data["county_label"] == "Philadelphia"]
-            if not philly_row.empty:
-                pr = philly_row.iloc[0]
-                c1, c2, c3, c4 = st.columns(4)
-                with c1:
-                    make_metric_card("Young Adults (25–34)", f"{pr['pop_25_34']:,.0f}")
-                with c2:
-                    make_metric_card("% Population 25–34", f"{pr['pop_25_34_pct']:.1f}%")
-                with c3:
-                    make_metric_card("Median Gross Rent", f"${pr['B25064_001E']:,.0f}")
-                with c4:
-                    make_metric_card("Renter-Occupied %", f"{pr['renter_pct']:.1f}%")
-
+        cdata=fetch_acs_counties(TRACT_VARS,sel_fips)
+        if not cdata.empty:
+            cdata=compute_tract_metrics(cdata)
+            pr=cdata[cdata["county_label"]=="Philadelphia"]
+            if not pr.empty:
+                pr=pr.iloc[0]; m1,m2,m3,m4=st.columns(4)
+                with m1: st.metric("Young Adults (25–34)",f"{pr['pop2534']:,.0f}")
+                with m2: st.metric("% Population 25–34",f"{pr['pct2534']:.1f}%")
+                with m3: st.metric("Median Rent",f"${pr['B25064_001E']:,.0f}")
+                with m4: st.metric("% Renters",f"{pr['renter_pct']:.1f}%")
             st.markdown("")
+            r1,r2=st.columns(2)
+            with r1:
+                s=cdata.sort_values("pct2534",ascending=True)
+                st.plotly_chart(bchart(s["county_label"].tolist(),s["pct2534"].tolist(),"% Age 25–34",C["teal"],True,"% pop"),use_container_width=True)
+            with r2:
+                s=cdata.sort_values("renter_pct",ascending=True)
+                st.plotly_chart(bchart(s["county_label"].tolist(),s["renter_pct"].tolist(),"Renter-Occupied %",C["coral"],True,"% renter"),use_container_width=True)
+            r3,r4=st.columns(2)
+            with r3:
+                s=cdata.sort_values("B25064_001E",ascending=True)
+                st.plotly_chart(bchart(s["county_label"].tolist(),s["B25064_001E"].tolist(),"Median Rent by County",C["gold"],True,"Rent","$"),use_container_width=True)
+            with r4:
+                s=cdata.sort_values("burden_pct",ascending=True)
+                st.plotly_chart(bchart(s["county_label"].tolist(),s["burden_pct"].tolist(),"Rent-Burdened (30%+ Income)",C["lavender"],True,"Burdened %"),use_container_width=True)
+            # Scatter
+            st.markdown('<div class="section-label">Affordability Matrix</div>',unsafe_allow_html=True)
+            fig=go.Figure(go.Scatter(x=cdata["B19013_001E"],y=cdata["B25064_001E"],mode="markers+text",
+                text=cdata["county_label"],textposition="top center",textfont=dict(size=11,color=C["text"]),
+                marker=dict(size=cdata["pct2534"]*3,color=cdata["renter_pct"],
+                    colorscale=[[0,C["slate"]],[1,C["gold"]]],colorbar=dict(title="Renter%"),
+                    line=dict(width=1,color="rgba(255,255,255,0.2)")),
+                hovertemplate="<b>%{text}</b><br>Income: $%{x:,.0f}<br>Rent: $%{y:,.0f}<extra></extra>"))
+            fig.update_layout(**BL,title=dict(text="Rent vs Income (Bubble=Young Adult %)",font=dict(size=16)),
+                xaxis_title="Median HH Income",yaxis_title="Median Rent",xaxis_tickprefix="$",yaxis_tickprefix="$")
+            st.plotly_chart(fig,use_container_width=True)
+        # Tract-level
+        st.markdown('<div class="section-label">Tract-Level Hotspots (Philadelphia)</div>',unsafe_allow_html=True)
+        tdf=fetch_acs_tracts(TRACT_VARS,"42","101")
+        if not tdf.empty:
+            tdf=compute_tract_metrics(tdf); v=compute_demand_score(tdf)
+            top=v.nlargest(25,"score").copy()
+            top["lbl"]=top["NAME"].str.replace(r"Census Tract (\d+\.?\d*),.*",r"Tract \1",regex=True)
+            tc1,tc2=st.columns(2)
+            with tc1: st.plotly_chart(bchart(top["lbl"].tolist()[:15],top["score"].tolist()[:15],"Top 15 — Demand Score",C["gold"],yl="Score"),use_container_width=True)
+            with tc2:
+                fig=go.Figure(go.Scatter(x=v["B25064_001E"],y=v["pct2534"],mode="markers",
+                    marker=dict(size=5,color=v["score"],opacity=0.7,
+                        colorscale=[[0,C["slate"]],[0.5,C["teal"]],[1,C["gold"]]],colorbar=dict(title="Score")),
+                    customdata=np.column_stack((v["NAME"].values,v["score"].values)),
+                    hovertemplate="<b>%{customdata[0]}</b><br>Rent: $%{x:,.0f}<br>%25-34: %{y:.1f}%<br>Score: %{customdata[1]:.0f}<extra></extra>"))
+                fig.update_layout(**BL,title=dict(text="All Tracts — Rent vs Young Adult %",font=dict(size=16)),
+                    xaxis_title="Median Rent ($)",yaxis_title="% Age 25–34",xaxis_tickprefix="$")
+                st.plotly_chart(fig,use_container_width=True)
+            with st.expander("📋 Top 25 Tracts Data"):
+                d=top[["lbl","score","pop2534","pct2534","renter_pct","B25064_001E","B19013_001E","r2i"]].rename(columns={
+                    "lbl":"Tract","score":"Score","pop2534":"Pop 25-34","pct2534":"% 25-34",
+                    "renter_pct":"% Renters","B25064_001E":"Med Rent","B19013_001E":"Med Income","r2i":"Rent/Inc %"})
+                st.dataframe(d.style.format({"Score":"{:.0f}","Pop 25-34":"{:,.0f}","% 25-34":"{:.1f}%",
+                    "% Renters":"{:.1f}%","Med Rent":"${:,.0f}","Med Income":"${:,.0f}","Rent/Inc %":"{:.1f}%"}),
+                    use_container_width=True,hide_index=True)
 
-            # Charts
-            col_r1, col_r2 = st.columns(2)
-
-            with col_r1:
-                sorted_df = county_data.sort_values("pop_25_34_pct", ascending=True)
-                fig = build_bar_chart(
-                    sorted_df["county_label"].tolist(),
-                    sorted_df["pop_25_34_pct"].tolist(),
-                    "Population Age 25–34 as % of Total",
-                    color=COLORS["teal"],
-                    horizontal=True,
-                    y_label="% of pop",
-                )
-                st.plotly_chart(fig, use_container_width=True)
-
-            with col_r2:
-                sorted_df = county_data.sort_values("renter_pct", ascending=True)
-                fig = build_bar_chart(
-                    sorted_df["county_label"].tolist(),
-                    sorted_df["renter_pct"].tolist(),
-                    "Renter-Occupied Housing as % of Total",
-                    color=COLORS["coral"],
-                    horizontal=True,
-                    y_label="Renter %",
-                )
-                st.plotly_chart(fig, use_container_width=True)
-
-            col_r3, col_r4 = st.columns(2)
-
-            with col_r3:
-                sorted_df = county_data.sort_values("B25064_001E", ascending=True)
-                fig = build_bar_chart(
-                    sorted_df["county_label"].tolist(),
-                    sorted_df["B25064_001E"].tolist(),
-                    "Median Gross Rent by County",
-                    color=COLORS["gold"],
-                    horizontal=True,
-                    y_label="Rent ($)",
-                )
-                st.plotly_chart(fig, use_container_width=True)
-
-            with col_r4:
-                sorted_df = county_data.sort_values("rent_burden_pct", ascending=True)
-                fig = build_bar_chart(
-                    sorted_df["county_label"].tolist(),
-                    sorted_df["rent_burden_pct"].tolist(),
-                    "Rent-Burdened Households (30%+ of Income on Rent)",
-                    color=COLORS["lavender"],
-                    horizontal=True,
-                    y_label="Burdened %",
-                )
-                st.plotly_chart(fig, use_container_width=True)
-
-            # Rent vs Income scatter
-            st.markdown('<div class="section-label">Affordability Matrix</div>', unsafe_allow_html=True)
-
-            fig = go.Figure()
-            fig.add_trace(
-                go.Scatter(
-                    x=county_data["B19013_001E"],
-                    y=county_data["B25064_001E"],
-                    mode="markers+text",
-                    text=county_data["county_label"],
-                    textposition="top center",
-                    textfont=dict(size=11, color=COLORS["text"]),
-                    marker=dict(
-                        size=county_data["pop_25_34_pct"] * 3,
-                        color=county_data["renter_pct"],
-                        colorscale=[[0, COLORS["slate"]], [1, COLORS["gold"]]],
-                        colorbar=dict(title="Renter %"),
-                        line=dict(width=1, color="rgba(255,255,255,0.2)"),
-                    ),
-                    hovertemplate=(
-                        "<b>%{text}</b><br>"
-                        "Median HH Income: $%{x:,.0f}<br>"
-                        "Median Rent: $%{y:,.0f}<br>"
-                        "<extra></extra>"
-                    ),
-                )
-            )
-            fig.update_layout(
-                **CHART_LAYOUT,
-                title=dict(
-                    text="Rent vs Income — Bubble Size = Young Adult Concentration",
-                    font=dict(size=16),
-                ),
-                xaxis_title="Median Household Income ($)",
-                yaxis_title="Median Gross Rent ($)",
-                xaxis_tickprefix="$",
-                yaxis_tickprefix="$",
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-        # ── Tract-level analysis for Philly ──
-        st.markdown('<div class="section-label">Philadelphia Tract-Level Analysis — Young Professional Hotspots</div>', unsafe_allow_html=True)
-
-        tract_vars = [
-            "B01001_011E",  # Male 25-29
-            "B01001_012E",  # Male 30-34
-            "B01001_035E",  # Female 25-29
-            "B01001_036E",  # Female 30-34
-            "B01003_001E",  # Total pop
-            "B25064_001E",  # Median gross rent
-            "B19013_001E",  # Median HH income
-            "B25003_003E",  # Renters
-            "B25003_001E",  # Total tenure
-        ]
-
-        tract_data = fetch_census_tract_data(tract_vars, state="42", county="101")
-
-        if not tract_data.empty:
-            for col in tract_vars:
-                tract_data[col] = pd.to_numeric(tract_data[col], errors="coerce")
-
-            tract_data["pop_25_34"] = (
-                tract_data["B01001_011E"]
-                + tract_data["B01001_012E"]
-                + tract_data["B01001_035E"]
-                + tract_data["B01001_036E"]
-            )
-            tract_data["pop_25_34_pct"] = tract_data["pop_25_34"] / tract_data["B01003_001E"] * 100
-            tract_data["renter_pct"] = tract_data["B25003_003E"] / tract_data["B25003_001E"] * 100
-            tract_data["rent_to_income"] = (tract_data["B25064_001E"] * 12) / tract_data["B19013_001E"] * 100
-
-            # Clean
-            tract_clean = tract_data.dropna(subset=["pop_25_34_pct", "B25064_001E", "B19013_001E"])
-            tract_clean = tract_clean[tract_clean["B01003_001E"] > 200]  # Meaningful population
-            tract_clean = tract_clean[tract_clean["pop_25_34_pct"] < 100]  # Filter outliers
-
-            # Compute a "Young Professional Demand Score"
-            # Composite: high 25-34 concentration + high renter % + moderate rent-to-income
-            scaler_cols = ["pop_25_34_pct", "renter_pct"]
-            for sc in scaler_cols:
-                min_v, max_v = tract_clean[sc].min(), tract_clean[sc].max()
-                if max_v > min_v:
-                    tract_clean[f"{sc}_norm"] = (tract_clean[sc] - min_v) / (max_v - min_v)
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 4: TRACT MAPS
+# ══════════════════════════════════════════════════════════════════════════════
+with t_maps:
+    st.markdown('<div class="section-label">Interactive Census Tract Maps</div>',unsafe_allow_html=True)
+    st.markdown('<div class="info-box">Choropleth maps at <b>census-tract level</b>. Hover any tract for details. Select metric and counties below.</div>',unsafe_allow_html=True)
+    if not CENSUS_API_KEY: st.info("👈 Enter Census API key.")
+    else:
+        pa_counties={k:v for k,v in COUNTY_FIPS.items() if v[0]=="42"}
+        map_sel=st.multiselect("Counties to map (PA)",list(pa_counties.keys()),default=["Philadelphia"],key="mc")
+        map_fips={k:v for k,v in pa_counties.items() if k in map_sel}
+        map_metric=st.selectbox("Metric",[
+            "Young Adults (% Age 25–34)","Median Gross Rent ($)","Renter-Occupied (%)",
+            "Median Household Income ($)","Rent Burden (30%+ Income)",
+            "Rent-to-Income Ratio (%)","Demand Score"])
+        if map_fips:
+            geo=load_geojson("42")
+            atract=fetch_multi_tracts(TRACT_VARS,map_fips)
+            if geo and not atract.empty:
+                atract=compute_tract_metrics(atract)
+                atract["GEOID"]=atract["state"]+atract["county"]+atract["tract"]
+                # demand score for all
+                scored=compute_demand_score(atract)
+                # metric mapping
+                mmap={"Young Adults (% Age 25–34)":("pct2534","% 25-34","","%"),
+                    "Median Gross Rent ($)":("B25064_001E","Median Rent","$",""),
+                    "Renter-Occupied (%)":("renter_pct","% Renters","","%"),
+                    "Median Household Income ($)":("B19013_001E","Med Income","$",""),
+                    "Rent Burden (30%+ Income)":("burden_pct","% Burdened","","%"),
+                    "Rent-to-Income Ratio (%)":("r2i","Rent/Income","","%"),
+                    "Demand Score":("score","Score","","")}
+                zcol,zlbl,zpre,zsuf=mmap[map_metric]
+                pdf=scored if zcol=="score" else atract
+                pdf=pdf.dropna(subset=[zcol])
+                # filter geojson features
+                cfset=set(atract["state"]+atract["county"])
+                fgeo={"type":"FeatureCollection","features":[
+                    f for f in geo["features"] if f["properties"]["STATEFP"]+f["properties"]["COUNTYFP"] in cfset]}
+                zoom=10.5 if len(map_sel)==1 else (9.5 if len(map_sel)<=3 else 8.5)
+                if zcol in ["burden_pct","r2i"]:
+                    cs=[[0,C["teal"]],[0.5,C["sand"]],[1,C["coral"]]]
                 else:
-                    tract_clean[f"{sc}_norm"] = 0
-
-            tract_clean["demand_score"] = (
-                tract_clean["pop_25_34_pct_norm"] * 0.5
-                + tract_clean["renter_pct_norm"] * 0.3
-                + (1 - tract_clean["rent_to_income"].clip(0, 60) / 60) * 0.2
-            ) * 100
-
-            # Top tracts
-            top_tracts = tract_clean.nlargest(20, "demand_score")
-
-            # Simplify tract name
-            top_tracts["tract_label"] = top_tracts["NAME"].str.replace(
-                r"Census Tract (\d+\.?\d*),.*", r"Tract \1", regex=True
-            )
-
-            col_t1, col_t2 = st.columns(2)
-
-            with col_t1:
-                fig = build_bar_chart(
-                    top_tracts["tract_label"].tolist()[:15],
-                    top_tracts["demand_score"].tolist()[:15],
-                    "Top 15 Tracts — Young Professional Demand Score",
-                    color=COLORS["gold"],
-                    y_label="Score",
-                )
-                st.plotly_chart(fig, use_container_width=True)
-
-            with col_t2:
-                fig = go.Figure()
-                fig.add_trace(
-                    go.Scatter(
-                        x=tract_clean["B25064_001E"],
-                        y=tract_clean["pop_25_34_pct"],
-                        mode="markers",
-                        marker=dict(
-                            size=5,
-                            color=tract_clean["demand_score"],
-                            colorscale=[[0, COLORS["slate"]], [0.5, COLORS["teal"]], [1, COLORS["gold"]]],
-                            colorbar=dict(title="Demand<br>Score"),
-                            opacity=0.7,
-                        ),
-                        hovertemplate=(
-                            "<b>%{customdata[0]}</b><br>"
-                            "Rent: $%{x:,.0f}<br>"
-                            "% Age 25-34: %{y:.1f}%<br>"
-                            "Score: %{customdata[1]:.0f}<extra></extra>"
-                        ),
-                        customdata=np.column_stack(
-                            (tract_clean["NAME"].values, tract_clean["demand_score"].values)
-                        ),
-                    )
-                )
+                    cs=[[0,C["slate"]],[0.5,C["teal"]],[1,C["gold"]]]
+                fig=go.Figure(go.Choroplethmapbox(
+                    geojson=fgeo,locations=pdf["GEOID"],z=pdf[zcol],
+                    featureidkey="properties.GEOID",text=pdf["NAME"],
+                    colorscale=cs,marker_opacity=0.75,marker_line_width=0.5,
+                    marker_line_color="rgba(255,255,255,0.15)",
+                    colorbar=dict(title=dict(text=zlbl,font=dict(size=11)),
+                        tickprefix=zpre,ticksuffix=zsuf,tickfont=dict(size=10),len=0.6),
+                    hovertemplate=f"<b>%{{text}}</b><br>{zlbl}: {zpre}%{{z:,.1f}}{zsuf}<extra></extra>"))
                 fig.update_layout(
-                    **CHART_LAYOUT,
-                    title=dict(text="All Philly Tracts — Rent vs Young Adult %", font=dict(size=16)),
-                    xaxis_title="Median Gross Rent ($)",
-                    yaxis_title="% Population Age 25–34",
-                    xaxis_tickprefix="$",
-                )
-                st.plotly_chart(fig, use_container_width=True)
-
-            # Detailed table
-            with st.expander("📋 View Top 20 Tracts — Detailed Data"):
-                display_cols = [
-                    "tract_label",
-                    "demand_score",
-                    "pop_25_34",
-                    "pop_25_34_pct",
-                    "renter_pct",
-                    "B25064_001E",
-                    "B19013_001E",
-                    "rent_to_income",
-                ]
-                display_names = {
-                    "tract_label": "Tract",
-                    "demand_score": "Demand Score",
-                    "pop_25_34": "Pop 25-34",
-                    "pop_25_34_pct": "% 25-34",
-                    "renter_pct": "% Renters",
-                    "B25064_001E": "Med. Rent ($)",
-                    "B19013_001E": "Med. HH Income ($)",
-                    "rent_to_income": "Rent/Income %",
-                }
-                display_df = top_tracts[display_cols].rename(columns=display_names)
-                st.dataframe(
-                    display_df.style.format(
-                        {
-                            "Demand Score": "{:.0f}",
-                            "Pop 25-34": "{:,.0f}",
-                            "% 25-34": "{:.1f}%",
-                            "% Renters": "{:.1f}%",
-                            "Med. Rent ($)": "${:,.0f}",
-                            "Med. HH Income ($)": "${:,.0f}",
-                            "Rent/Income %": "{:.1f}%",
-                        }
-                    ),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
+                    mapbox=dict(style="carto-darkmatter",center=dict(lat=39.99,lon=-75.16),zoom=zoom),
+                    paper_bgcolor="rgba(0,0,0,0)",font=dict(color=C["text"],family="DM Sans"),
+                    margin=dict(l=0,r=0,t=50,b=0),
+                    title=dict(text=f"{map_metric} — Census Tract Level",font=dict(size=16,color=C["text"])),height=620)
+                st.plotly_chart(fig,use_container_width=True)
+                st.markdown(f"**{len(pdf):,} tracts** across {', '.join(map_sel)}")
+                s1,s2,s3,s4=st.columns(4)
+                with s1: st.metric(f"Min",f"{zpre}{pdf[zcol].min():,.1f}{zsuf}")
+                with s2: st.metric(f"Median",f"{zpre}{pdf[zcol].median():,.1f}{zsuf}")
+                with s3: st.metric(f"Mean",f"{zpre}{pdf[zcol].mean():,.1f}{zsuf}")
+                with s4: st.metric(f"Max",f"{zpre}{pdf[zcol].max():,.1f}{zsuf}")
+            elif geo is None:
+                st.warning("Could not load tract boundaries. Make sure `geopandas` is installed.")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 4: DEMOGRAPHICS
+# TAB 5: DEMOGRAPHICS
 # ══════════════════════════════════════════════════════════════════════════════
-
-with tab_demographics:
-    st.markdown('<div class="section-label">Demographic Trends — Philadelphia County</div>', unsafe_allow_html=True)
-
-    # Population over time
-    pop_df = fetch_fred_series("PAPHIL5POP", "2000-01-01")
-
-    col_d1, col_d2 = st.columns(2)
-
-    with col_d1:
-        fig = build_time_series_chart(
-            pop_df,
-            "Resident Population — Philadelphia County (Thousands)",
-            y_label="Population",
-            color=COLORS["teal"],
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-    with col_d2:
-        labor_df = fetch_fred_series("LAUCN421010000000006", start_date)
-        fig = build_time_series_chart(
-            labor_df,
-            "Civilian Labor Force — Philadelphia County",
-            y_label="Labor Force",
-            color=COLORS["lavender"],
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
+with t_demo:
+    st.markdown('<div class="section-label">Demographic Trends</div>',unsafe_allow_html=True)
+    d1,d2=st.columns(2)
+    with d1: st.plotly_chart(lchart(fd.get("pop_philly",pd.DataFrame()),"Population — Philadelphia County (K)","Pop",C["teal"]),use_container_width=True)
+    with d2: st.plotly_chart(lchart(fd.get("labor_force",pd.DataFrame()),"Labor Force — Philadelphia County","LF",C["lavender"]),use_container_width=True)
     if CENSUS_API_KEY:
-        st.markdown('<div class="section-label">Age Distribution — County Comparison</div>', unsafe_allow_html=True)
-
-        # Age breakdown
-        age_vars = [
-            "B01001_003E", "B01001_004E", "B01001_005E", "B01001_006E",  # M <5, 5-9, 10-14, 15-17
-            "B01001_007E", "B01001_008E", "B01001_009E", "B01001_010E",  # M 18-19, 20, 21, 22-24
-            "B01001_011E", "B01001_012E", "B01001_013E", "B01001_014E",  # M 25-29, 30-34, 35-39, 40-44
-            "B01001_015E", "B01001_016E", "B01001_017E", "B01001_018E",  # M 45-49, 50-54, 55-59, 60-61
-            "B01001_019E", "B01001_020E", "B01001_021E", "B01001_022E",  # M 62-64, 65-66, 67-69, 70-74
-            "B01001_023E", "B01001_024E", "B01001_025E",                 # M 75-79, 80-84, 85+
-            "B01001_027E", "B01001_028E", "B01001_029E", "B01001_030E",  # F <5, 5-9, 10-14, 15-17
-            "B01001_031E", "B01001_032E", "B01001_033E", "B01001_034E",  # F 18-19, 20, 21, 22-24
-            "B01001_035E", "B01001_036E", "B01001_037E", "B01001_038E",  # F 25-29, 30-34, 35-39, 40-44
-            "B01001_039E", "B01001_040E", "B01001_041E", "B01001_042E",  # F 45-49, 50-54, 55-59, 60-61
-            "B01001_043E", "B01001_044E", "B01001_045E", "B01001_046E",  # F 62-64, 65-66, 67-69, 70-74
-            "B01001_047E", "B01001_048E", "B01001_049E",                 # F 75-79, 80-84, 85+
-            "B01003_001E",  # Total pop
-        ]
-
-        selected_fips = {k: v for k, v in COUNTY_FIPS.items() if k in selected_counties}
-        age_data = fetch_census_acs_county_multi(age_vars, selected_fips)
-
-        if not age_data.empty:
-            for col in age_vars:
-                age_data[col] = pd.to_numeric(age_data[col], errors="coerce")
-
-            # Aggregate into age groups
-            age_data["under_18"] = (
-                age_data[["B01001_003E","B01001_004E","B01001_005E","B01001_006E",
-                          "B01001_027E","B01001_028E","B01001_029E","B01001_030E"]].sum(axis=1)
-            )
-            age_data["age_18_24"] = (
-                age_data[["B01001_007E","B01001_008E","B01001_009E","B01001_010E",
-                          "B01001_031E","B01001_032E","B01001_033E","B01001_034E"]].sum(axis=1)
-            )
-            age_data["age_25_34"] = (
-                age_data[["B01001_011E","B01001_012E","B01001_035E","B01001_036E"]].sum(axis=1)
-            )
-            age_data["age_35_44"] = (
-                age_data[["B01001_013E","B01001_014E","B01001_037E","B01001_038E"]].sum(axis=1)
-            )
-            age_data["age_45_54"] = (
-                age_data[["B01001_015E","B01001_016E","B01001_039E","B01001_040E"]].sum(axis=1)
-            )
-            age_data["age_55_64"] = (
-                age_data[["B01001_017E","B01001_018E","B01001_019E",
-                          "B01001_041E","B01001_042E","B01001_043E"]].sum(axis=1)
-            )
-            age_data["age_65_plus"] = (
-                age_data[["B01001_020E","B01001_021E","B01001_022E","B01001_023E","B01001_024E","B01001_025E",
-                          "B01001_044E","B01001_045E","B01001_046E","B01001_047E","B01001_048E","B01001_049E"]].sum(axis=1)
-            )
-
-            total_pop = age_data["B01003_001E"]
-            age_groups = ["under_18", "age_18_24", "age_25_34", "age_35_44", "age_45_54", "age_55_64", "age_65_plus"]
-            age_labels = ["Under 18", "18–24", "25–34", "35–44", "45–54", "55–64", "65+"]
-            group_colors = [COLORS["steel"], COLORS["sky"], COLORS["gold"], COLORS["teal"],
-                            COLORS["lavender"], COLORS["coral"], COLORS["sand"]]
-
-            fig = go.Figure()
-            for grp, lbl, clr in zip(age_groups, age_labels, group_colors):
-                pcts = (age_data[grp] / total_pop * 100).tolist()
-                fig.add_trace(
-                    go.Bar(
-                        x=age_data["county_label"],
-                        y=pcts,
-                        name=lbl,
-                        marker_color=clr,
-                        hovertemplate=f"<b>%{{x}}</b><br>{lbl}: %{{y:.1f}}%<extra></extra>",
-                    )
-                )
-            fig.update_layout(
-                **CHART_LAYOUT,
-                barmode="stack",
-                title=dict(text="Age Distribution by County (% of Population)", font=dict(size=16)),
-                yaxis_ticksuffix="%",
-                legend=dict(orientation="h", y=-0.15),
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
+        st.markdown('<div class="section-label">Age Distribution</div>',unsafe_allow_html=True)
+        age_v=["B01001_003E","B01001_004E","B01001_005E","B01001_006E","B01001_007E","B01001_008E","B01001_009E","B01001_010E",
+            "B01001_011E","B01001_012E","B01001_013E","B01001_014E","B01001_015E","B01001_016E","B01001_017E","B01001_018E",
+            "B01001_019E","B01001_020E","B01001_021E","B01001_022E","B01001_023E","B01001_024E","B01001_025E",
+            "B01001_027E","B01001_028E","B01001_029E","B01001_030E","B01001_031E","B01001_032E","B01001_033E","B01001_034E",
+            "B01001_035E","B01001_036E","B01001_037E","B01001_038E","B01001_039E","B01001_040E","B01001_041E","B01001_042E",
+            "B01001_043E","B01001_044E","B01001_045E","B01001_046E","B01001_047E","B01001_048E","B01001_049E","B01003_001E"]
+        adf=fetch_acs_counties(age_v,sel_fips)
+        if not adf.empty:
+            for c_ in age_v: adf[c_]=pd.to_numeric(adf[c_],errors="coerce")
+            adf["u18"]=adf[["B01001_003E","B01001_004E","B01001_005E","B01001_006E","B01001_027E","B01001_028E","B01001_029E","B01001_030E"]].sum(1)
+            adf["a1824"]=adf[["B01001_007E","B01001_008E","B01001_009E","B01001_010E","B01001_031E","B01001_032E","B01001_033E","B01001_034E"]].sum(1)
+            adf["a2534"]=adf[["B01001_011E","B01001_012E","B01001_035E","B01001_036E"]].sum(1)
+            adf["a3544"]=adf[["B01001_013E","B01001_014E","B01001_037E","B01001_038E"]].sum(1)
+            adf["a4554"]=adf[["B01001_015E","B01001_016E","B01001_039E","B01001_040E"]].sum(1)
+            adf["a5564"]=adf[["B01001_017E","B01001_018E","B01001_019E","B01001_041E","B01001_042E","B01001_043E"]].sum(1)
+            adf["a65"]=adf[["B01001_020E","B01001_021E","B01001_022E","B01001_023E","B01001_024E","B01001_025E","B01001_044E","B01001_045E","B01001_046E","B01001_047E","B01001_048E","B01001_049E"]].sum(1)
+            tot=adf["B01003_001E"]
+            grps=["u18","a1824","a2534","a3544","a4554","a5564","a65"]
+            lbls=["Under 18","18–24","25–34","35–44","45–54","55–64","65+"]
+            clrs=[C["steel"],C["sky"],C["gold"],C["teal"],C["lavender"],C["coral"],C["sand"]]
+            fig=go.Figure()
+            for g,l,cl in zip(grps,lbls,clrs):
+                fig.add_trace(go.Bar(x=adf["county_label"],y=(adf[g]/tot*100),name=l,marker_color=cl,
+                    hovertemplate=f"<b>%{{x}}</b><br>{l}: %{{y:.1f}}%<extra></extra>"))
+            fig.update_layout(**BL,barmode="stack",title=dict(text="Age Distribution (%)",font=dict(size=16)),
+                yaxis_ticksuffix="%",legend=dict(orientation="h",y=-0.15,bgcolor="rgba(0,0,0,0)",font=dict(size=11)))
+            st.plotly_chart(fig,use_container_width=True)
         # Education
-        st.markdown('<div class="section-label">Education Attainment (25+)</div>', unsafe_allow_html=True)
-
-        edu_vars = [
-            "B15003_001E",  # Total 25+
-            "B15003_022E",  # Bachelor's
-            "B15003_023E",  # Master's
-            "B15003_024E",  # Professional
-            "B15003_025E",  # Doctorate
-            "B15003_017E",  # HS diploma
-            "B15003_018E",  # GED
-        ]
-
-        edu_data = fetch_census_acs_county_multi(edu_vars, selected_fips)
-
-        if not edu_data.empty:
-            for col in edu_vars:
-                edu_data[col] = pd.to_numeric(edu_data[col], errors="coerce")
-
-            edu_data["bachelors_plus_pct"] = (
-                (edu_data["B15003_022E"] + edu_data["B15003_023E"] + edu_data["B15003_024E"] + edu_data["B15003_025E"])
-                / edu_data["B15003_001E"]
-                * 100
-            )
-            edu_data["hs_pct"] = (
-                (edu_data["B15003_017E"] + edu_data["B15003_018E"]) / edu_data["B15003_001E"] * 100
-            )
-
-            col_e1, col_e2 = st.columns(2)
-            with col_e1:
-                sorted_edu = edu_data.sort_values("bachelors_plus_pct", ascending=True)
-                fig = build_bar_chart(
-                    sorted_edu["county_label"].tolist(),
-                    sorted_edu["bachelors_plus_pct"].tolist(),
-                    "Bachelor's Degree or Higher (%)",
-                    color=COLORS["teal"],
-                    horizontal=True,
-                    y_label="% of 25+",
-                )
-                st.plotly_chart(fig, use_container_width=True)
-
-            with col_e2:
-                sorted_edu = edu_data.sort_values("hs_pct", ascending=True)
-                fig = build_bar_chart(
-                    sorted_edu["county_label"].tolist(),
-                    sorted_edu["hs_pct"].tolist(),
-                    "HS Diploma / GED Only (%)",
-                    color=COLORS["sand"],
-                    horizontal=True,
-                    y_label="% of 25+",
-                )
-                st.plotly_chart(fig, use_container_width=True)
-
+        st.markdown('<div class="section-label">Education (25+)</div>',unsafe_allow_html=True)
+        ev=["B15003_001E","B15003_022E","B15003_023E","B15003_024E","B15003_025E","B15003_017E","B15003_018E"]
+        edf=fetch_acs_counties(ev,sel_fips)
+        if not edf.empty:
+            for c_ in ev: edf[c_]=pd.to_numeric(edf[c_],errors="coerce")
+            edf["bach"]=(edf[["B15003_022E","B15003_023E","B15003_024E","B15003_025E"]].sum(1)/edf["B15003_001E"]*100)
+            edf["hs"]=((edf["B15003_017E"]+edf["B15003_018E"])/edf["B15003_001E"]*100)
+            e1,e2=st.columns(2)
+            with e1:
+                s=edf.sort_values("bach",ascending=True)
+                st.plotly_chart(bchart(s["county_label"].tolist(),s["bach"].tolist(),"Bachelor's+ (%)",C["teal"],True,"% 25+"),use_container_width=True)
+            with e2:
+                s=edf.sort_values("hs",ascending=True)
+                st.plotly_chart(bchart(s["county_label"].tolist(),s["hs"].tolist(),"HS/GED Only (%)",C["sand"],True,"% 25+"),use_container_width=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 5: REGIONAL COMPARISON
+# TAB 6: REGIONAL
 # ══════════════════════════════════════════════════════════════════════════════
-
-with tab_regional:
-    st.markdown('<div class="section-label">Regional Market Comparison</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="info-box">'
-        "Comparing Philadelphia County with surrounding markets: Montgomery, Bucks, Delaware, Chester, "
-        "Berks (Reading), and South Jersey (Camden, Burlington, Gloucester counties)."
-        "</div>",
-        unsafe_allow_html=True,
-    )
-
+with t_reg:
+    st.markdown('<div class="section-label">Regional Comparison</div>',unsafe_allow_html=True)
+    st.markdown('<div class="info-box">Full cross-county scorecard with <b>Blue-Collar Rental Opportunity Score</b>.</div>',unsafe_allow_html=True)
     if CENSUS_API_KEY:
-        # Comprehensive comparison
-        comp_vars = [
-            "B01003_001E",  # Total pop
-            "B19013_001E",  # Median HH income
-            "B25064_001E",  # Median gross rent
-            "B25003_001E",  # Total tenure
-            "B25003_003E",  # Renters
-            "B25077_001E",  # Median home value
-            "B01001_011E", "B01001_012E", "B01001_035E", "B01001_036E",  # 25-34
-            "B23025_003E",  # In labor force
-            "B23025_005E",  # Unemployed
-            "B23025_002E",  # In labor force (total)
-        ]
-
-        all_fips = COUNTY_FIPS.copy()
-        comp_data = fetch_census_acs_county_multi(comp_vars, all_fips)
-
-        if not comp_data.empty:
-            for col in comp_vars:
-                comp_data[col] = pd.to_numeric(comp_data[col], errors="coerce")
-
-            comp_data["pop_25_34"] = (
-                comp_data["B01001_011E"] + comp_data["B01001_012E"]
-                + comp_data["B01001_035E"] + comp_data["B01001_036E"]
-            )
-            comp_data["pop_25_34_pct"] = comp_data["pop_25_34"] / comp_data["B01003_001E"] * 100
-            comp_data["renter_pct"] = comp_data["B25003_003E"] / comp_data["B25003_001E"] * 100
-            comp_data["rent_to_income_annual"] = (comp_data["B25064_001E"] * 12) / comp_data["B19013_001E"] * 100
-            comp_data["local_unemp"] = comp_data["B23025_005E"] / comp_data["B23025_002E"] * 100
-
-            # Summary comparison table
-            st.markdown('<div class="section-label">Comparison Scorecard</div>', unsafe_allow_html=True)
-
-            display_comp = comp_data[[
-                "county_label", "B01003_001E", "B19013_001E", "B25064_001E",
-                "B25077_001E", "pop_25_34_pct", "renter_pct", "rent_to_income_annual", "local_unemp",
-            ]].rename(columns={
-                "county_label": "County",
-                "B01003_001E": "Population",
-                "B19013_001E": "Med. HH Income",
-                "B25064_001E": "Med. Rent",
-                "B25077_001E": "Med. Home Value",
-                "pop_25_34_pct": "% Age 25-34",
-                "renter_pct": "% Renters",
-                "rent_to_income_annual": "Rent/Income %",
-                "local_unemp": "Unemp. Rate %",
-            }).sort_values("Population", ascending=False)
-
-            st.dataframe(
-                display_comp.style.format({
-                    "Population": "{:,.0f}",
-                    "Med. HH Income": "${:,.0f}",
-                    "Med. Rent": "${:,.0f}",
-                    "Med. Home Value": "${:,.0f}",
-                    "% Age 25-34": "{:.1f}%",
-                    "% Renters": "{:.1f}%",
-                    "Rent/Income %": "{:.1f}%",
-                    "Unemp. Rate %": "{:.1f}%",
-                }).background_gradient(cmap="YlOrRd", subset=["% Age 25-34", "% Renters"]),
-                use_container_width=True,
-                hide_index=True,
-            )
-
-            st.markdown("")
-
-            # Radar / parallel coordinates
-            col_p1, col_p2 = st.columns(2)
-
-            with col_p1:
-                sorted_comp = comp_data.sort_values("B25077_001E", ascending=True)
-                fig = build_bar_chart(
-                    sorted_comp["county_label"].tolist(),
-                    sorted_comp["B25077_001E"].tolist(),
-                    "Median Home Value by County",
-                    color=COLORS["teal"],
-                    horizontal=True,
-                    y_label="Home Value ($)",
-                )
-                st.plotly_chart(fig, use_container_width=True)
-
-            with col_p2:
-                sorted_comp = comp_data.sort_values("local_unemp", ascending=True)
-                fig = build_bar_chart(
-                    sorted_comp["county_label"].tolist(),
-                    sorted_comp["local_unemp"].tolist(),
-                    "Local Unemployment Rate (%)",
-                    color=COLORS["coral"],
-                    horizontal=True,
-                    y_label="Unemp %",
-                )
-                st.plotly_chart(fig, use_container_width=True)
-
+        comp=fetch_acs_counties(TRACT_VARS,COUNTY_FIPS)
+        if not comp.empty:
+            comp=compute_tract_metrics(comp)
+            # Scorecard
+            st.markdown('<div class="section-label">Scorecard</div>',unsafe_allow_html=True)
+            disp=comp[["county_label","B01003_001E","B19013_001E","B25064_001E","pct2534","renter_pct","r2i","unemp"]].rename(columns={
+                "county_label":"County","B01003_001E":"Population","B19013_001E":"Med Income",
+                "B25064_001E":"Med Rent","pct2534":"% 25-34","renter_pct":"% Renters","r2i":"Rent/Inc %","unemp":"Unemp %"
+            }).sort_values("Population",ascending=False)
+            st.dataframe(disp.style.format({"Population":"{:,.0f}","Med Income":"${:,.0f}","Med Rent":"${:,.0f}",
+                "% 25-34":"{:.1f}%","% Renters":"{:.1f}%","Rent/Inc %":"{:.1f}%","Unemp %":"{:.1f}%"
+            }).background_gradient(cmap="YlOrRd",subset=["% 25-34","% Renters"]),use_container_width=True,hide_index=True)
             # Opportunity Score
-            st.markdown('<div class="section-label">Blue-Collar Rental Opportunity Score</div>', unsafe_allow_html=True)
-            st.markdown(
-                '<div class="info-box">'
-                "This composite score weighs: young adult concentration (25%), renter prevalence (25%), "
-                "rent affordability (25%), and employment strength (25%). Higher = stronger opportunity "
-                "for quality blue-collar rental demand."
-                "</div>",
-                unsafe_allow_html=True,
-            )
+            st.markdown('<div class="section-label">Blue-Collar Rental Opportunity Score</div>',unsafe_allow_html=True)
+            st.markdown('<div class="info-box">Composite: Young adults (25%) + Renter prevalence (25%) + Affordability (25%) + Employment (25%).</div>',unsafe_allow_html=True)
+            factors={"pct2534":True,"renter_pct":True,"r2i":False,"unemp":False}
+            for col,higher in factors.items():
+                mn,mx=comp[col].min(),comp[col].max()
+                n=((comp[col]-mn)/(mx-mn)) if mx>mn else 0.5
+                comp[f"{col}_s"]=n if higher else (1-n)
+            comp["opp"]=(comp["pct2534_s"]+comp["renter_pct_s"]+comp["r2i_s"]+comp["unemp_s"])*25
+            cs=comp.sort_values("opp",ascending=True)
+            fig=go.Figure(go.Bar(y=cs["county_label"],x=cs["opp"],orientation="h",
+                marker=dict(color=cs["opp"],colorscale=[[0,C["slate"]],[0.5,C["teal"]],[1,C["gold"]]]),
+                hovertemplate="<b>%{y}</b><br>Score: %{x:.1f}/100<extra></extra>"))
+            fig.update_layout(**BL,title=dict(text="Opportunity Score (0–100)",font=dict(size=16)),xaxis_title="Score")
+            st.plotly_chart(fig,use_container_width=True)
+            with st.expander("📋 Score Breakdown"):
+                sb=comp[["county_label","pct2534_s","renter_pct_s","r2i_s","unemp_s","opp"]].rename(columns={
+                    "county_label":"County","pct2534_s":"Young Adults","renter_pct_s":"Renters",
+                    "r2i_s":"Affordability","unemp_s":"Employment","opp":"Total"}).sort_values("Total",ascending=False)
+                for c_ in ["Young Adults","Renters","Affordability","Employment"]: sb[c_]=(sb[c_]*25).round(1)
+                sb["Total"]=sb["Total"].round(1)
+                st.dataframe(sb,use_container_width=True,hide_index=True)
+    else: st.info("Enter Census API key in sidebar.")
 
-            # Normalize each factor 0-1
-            factors = {
-                "pop_25_34_pct": True,    # Higher = better
-                "renter_pct": True,        # Higher = better (more renters)
-                "rent_to_income_annual": False,  # Lower = better (more affordable)
-                "local_unemp": False,      # Lower = better
-            }
-
-            for col, higher_better in factors.items():
-                min_v = comp_data[col].min()
-                max_v = comp_data[col].max()
-                if max_v > min_v:
-                    normalized = (comp_data[col] - min_v) / (max_v - min_v)
-                    if not higher_better:
-                        normalized = 1 - normalized
-                    comp_data[f"{col}_score"] = normalized
-                else:
-                    comp_data[f"{col}_score"] = 0.5
-
-            comp_data["opportunity_score"] = (
-                comp_data["pop_25_34_pct_score"] * 25
-                + comp_data["renter_pct_score"] * 25
-                + comp_data["rent_to_income_annual_score"] * 25
-                + comp_data["local_unemp_score"] * 25
-            )
-
-            comp_sorted = comp_data.sort_values("opportunity_score", ascending=True)
-
-            fig = go.Figure()
-            fig.add_trace(
-                go.Bar(
-                    y=comp_sorted["county_label"],
-                    x=comp_sorted["opportunity_score"],
-                    orientation="h",
-                    marker=dict(
-                        color=comp_sorted["opportunity_score"],
-                        colorscale=[[0, COLORS["slate"]], [0.5, COLORS["teal"]], [1, COLORS["gold"]]],
-                    ),
-                    hovertemplate="<b>%{y}</b><br>Score: %{x:.1f}/100<extra></extra>",
-                )
-            )
-            fig.update_layout(
-                **CHART_LAYOUT,
-                title=dict(text="Blue-Collar Rental Opportunity Score (0–100)", font=dict(size=16)),
-                xaxis_title="Opportunity Score",
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-            # Score breakdown
-            with st.expander("📋 Score Breakdown by County"):
-                score_display = comp_data[[
-                    "county_label",
-                    "pop_25_34_pct_score", "renter_pct_score",
-                    "rent_to_income_annual_score", "local_unemp_score",
-                    "opportunity_score",
-                ]].rename(columns={
-                    "county_label": "County",
-                    "pop_25_34_pct_score": "Young Adults (25pt)",
-                    "renter_pct_score": "Renter Prevalence (25pt)",
-                    "rent_to_income_annual_score": "Rent Affordability (25pt)",
-                    "local_unemp_score": "Employment Strength (25pt)",
-                    "opportunity_score": "Total Score",
-                }).sort_values("Total Score", ascending=False)
-
-                for col in score_display.columns[1:]:
-                    score_display[col] = score_display[col].apply(
-                        lambda x: f"{x:.1f}" if col == "Total Score" else f"{x*25:.1f}"
-                    )
-
-                st.dataframe(score_display, use_container_width=True, hide_index=True)
-    else:
-        st.info("Enter your Census API key in the sidebar to load regional comparison data.")
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# FOOTER
-# ──────────────────────────────────────────────────────────────────────────────
-
+# ── FOOTER ──
 st.markdown("---")
-st.markdown(
-    """
-    <div style="text-align: center; color: #5A6270; font-size: 0.8rem; padding: 1rem 0;">
-        <b style="color:#C8A951;">Lapstone Intel</b> · Philadelphia Construction & Real Estate Intelligence<br>
-        Data: Federal Reserve (FRED) · U.S. Census Bureau (ACS) · Bureau of Labor Statistics (QCEW)<br>
-        Dashboard refreshes every 6 hours · Last loaded: {timestamp}
-    </div>
-    """.format(timestamp=datetime.now().strftime("%B %d, %Y at %I:%M %p")),
-    unsafe_allow_html=True,
-)
+st.markdown(f'<div style="text-align:center;color:#5A6270;font-size:.8rem;padding:1rem 0"><b style="color:#C8A951">Lapstone Intel</b> · Philadelphia Construction & Real Estate Intelligence<br>Data: FRED · Census ACS · BLS QCEW · Loaded: {datetime.now().strftime("%B %d, %Y %I:%M %p")}</div>',unsafe_allow_html=True)
