@@ -25,9 +25,9 @@ FRED_SERIES = {
     "unemp_philly":"PAPHIL5URN","pop_philly":"PAPHIL5POP",
     "labor_force":"LAUCN421010000000006","med_income":"MHIPA42101A052NCEN",
     "homeown":"HOWNRATEACS042101","unemp_msa":"PHIL942URN",
-    "const_emp":"PHIL942CONS","nonfarm":"PHIL942NA",
+    "const_emp":"SMU42379801500000001SA","nonfarm":"SMU42379800000000001SA",
     "permits_tot":"PHIL942BPPRIV","permits_1u":"PHIL942BP1FH",
-    "gdp":"NGMP37964","cpi_shelter":"CUURS12ASAH","cpi_all":"CUURS12ASA0",
+    "gdp":"NGMP37980","cpi_shelter":"CUURA102SAH1","cpi_all":"CUURA102SA0",
 }
 C = {"gold":"#C8A951","slate":"#4A6274","teal":"#2EC4B6","coral":"#E76F51",
      "lavender":"#9B8EC7","sky":"#48A9A6","sand":"#D4A373","steel":"#7F8C9B",
@@ -142,7 +142,9 @@ def bchart(names,vals,title,color=C["gold"],horiz=False,yl="",yp=""):
     fig.update_layout(**BL,title=dict(text=title,font=dict(size=16))); return fig
 
 def compute_tract_metrics(df):
-    for col in TRACT_VARS: df[col]=pd.to_numeric(df[col],errors="coerce")
+    for col in TRACT_VARS:
+        df[col]=pd.to_numeric(df[col],errors="coerce")
+        df.loc[df[col]<=-666666666,col]=np.nan
     df["pop2534"]=df[["B01001_011E","B01001_012E","B01001_035E","B01001_036E"]].sum(axis=1)
     df["pct2534"]=df["pop2534"]/df["B01003_001E"]*100
     df["renter_pct"]=df["B25003_003E"]/df["B25003_001E"]*100
