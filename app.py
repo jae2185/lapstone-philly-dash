@@ -64,6 +64,7 @@ TT = {
     "opp_score": "**Opportunity Score** — Composite: 25% young adults + 25% renter share + 25% affordability + 25% employment strength. Identifies best counties for blue-collar rental investment.",
     "cpi_shelter": "**Shelter CPI** — Consumer price index for housing costs (rent, owners' equivalent rent). YoY % change shows how fast housing costs are rising.",
     "forecast": "**Forecast Model** — Uses Ridge regression on lagged FRED indicators (unemployment, permits, CPI, GDP) to predict next-year values. Backtested with expanding-window walk-forward validation.",
+    "opp_pred": "**Opportunity Prediction** — Ranks census tracts by projected investment potential. Combines current fundamentals (demand, affordability), momentum (ACS year-over-year changes), and macro forecast direction into a single forward-looking score.",
 }
 
 def tip(key):
@@ -216,16 +217,12 @@ def run_forecast(annual, target_col, n_backtest=5):
     from sklearn.preprocessing import StandardScaler
     if target_col not in annual.columns or len(annual) < 8:
         return None
-    # Forward-fill then drop remaining NaN to build clean annual matrix
-    clean = annual.ffill().bfill().dropna(axis=1)
-    if target_col not in clean.columns or len(clean) < 8:
-        return None
-    feature_cols = [c for c in clean.columns]
-    # Create 1-year lag features
-    lagged = clean.shift(1)
+    df = annual.dropna(subset=[target_col]).copy()
+    # Create lag features (1-year lag of all available columns)
+    feature_cols = [c for c in df.columns]
+    lagged = df[feature_cols].shift(1)
     lagged.columns = [f"{c}_lag1" for c in feature_cols]
-    combo = pd.concat([clean[[target_col]], lagged], axis=1).iloc[1:]  # drop first row (NaN from shift)
-    combo = combo.replace([np.inf, -np.inf], np.nan).dropna()
+    combo = pd.concat([df[[target_col]], lagged], axis=1).dropna()
     if len(combo) < 6: return None
     X = combo.drop(columns=[target_col])
     y = combo[target_col]
@@ -243,27 +240,122 @@ def run_forecast(annual, target_col, n_backtest=5):
     bt = pd.DataFrame(bt_results)
     if bt.empty: return None
     bt["error"] = bt["predicted"] - bt["actual"]
-    bt["abs_pct_error"] = (bt["error"].abs() / bt["actual"].abs().clip(lower=0.01)) * 100
+    bt["abs_pct_error"] = (bt["error"].abs() / bt["actual"].abs()) * 100
     mape = bt["abs_pct_error"].mean()
     rmse = np.sqrt((bt["error"]**2).mean())
-    # Final forecast
+    # Final forecast: train on ALL data, predict next year
     sc = StandardScaler(); X_s = sc.fit_transform(X); m = Ridge(alpha=1.0); m.fit(X_s, y)
-    last_vals = clean[feature_cols].iloc[-1:].copy()
-    last_vals.columns = [f"{c}_lag1" for c in feature_cols]
-    last_vals = last_vals[feat_names].fillna(0)
-    forecast_val = m.predict(sc.transform(last_vals))[0]
-    forecast_year = int(clean.index[-1]) + 1
-    std_err = bt["error"].std() if len(bt) > 1 else abs(forecast_val) * 0.05
+    last_row = df[feature_cols].iloc[-1:].copy()
+    last_row.columns = [f"{c}_lag1" for c in feature_cols]
+    forecast_val = m.predict(sc.transform(last_row))[0]
+    forecast_year = int(df.index[-1]) + 1
+    # Confidence interval from backtest residuals
+    std_err = bt["error"].std()
     ci_low = forecast_val - 1.96 * std_err
     ci_high = forecast_val + 1.96 * std_err
+    # Feature importance
     coefs = pd.Series(m.coef_, index=feat_names).abs().sort_values(ascending=False)
     return {
         "backtest": bt, "mape": mape, "rmse": rmse,
         "forecast_year": forecast_year, "forecast_val": forecast_val,
         "ci_low": ci_low, "ci_high": ci_high,
-        "last_actual_year": int(clean.index[-1]), "last_actual_val": y.iloc[-1],
+        "last_actual_year": int(df.index[-1]), "last_actual_val": y.iloc[-1],
         "importance": coefs, "n_train": len(combo),
     }
+
+# ── OPPORTUNITY AREA PREDICTION ──
+@st.cache_data(ttl=3600*12, show_spinner=False)
+def fetch_acs_tracts_year(variables, state="42", county="101", year=2023):
+    """Fetch tract data for a specific ACS year."""
+    return fetch_acs_tracts(variables, state, county, year)
+
+def compute_tract_opportunity(tracts_current, tracts_prior, macro_forecasts):
+    """
+    Score each tract on forward-looking investment potential.
+    Components:
+      1. Fundamentals (40%): demand score, renter %, young adults
+      2. Momentum (30%): YoY improvement in rent, income, young adult share
+      3. Affordability Headroom (20%): low rent-to-income = room for rent growth
+      4. Macro Alignment (10%): tracts that benefit from forecasted macro direction
+    """
+    curr = tracts_current.copy()
+    if curr.empty: return pd.DataFrame()
+
+    # -- Fundamentals (reuse demand score) --
+    scored = compute_demand_score(curr)
+    if scored.empty: return pd.DataFrame()
+    fund_min, fund_max = scored["score"].min(), scored["score"].max()
+    scored["fund_n"] = (scored["score"] - fund_min) / (fund_max - fund_min + 0.01)
+
+    # -- Momentum: compare to prior year --
+    if not tracts_prior.empty:
+        prior = compute_tract_metrics(tracts_prior.copy())
+        prior["GEOID_p"] = prior["state"] + prior["county"] + prior["tract"]
+        prior_cols = {"GEOID_p": "GEOID", "pct2534": "pct2534_prev", "B25064_001E": "rent_prev",
+                      "B19013_001E": "income_prev", "renter_pct": "renter_prev"}
+        pm = prior[list(prior_cols.keys())].rename(columns=prior_cols)
+        scored = scored.merge(pm, on="GEOID", how="left")
+        # Rent growth (positive = rents rising = good for landlords)
+        scored["rent_growth"] = ((scored["B25064_001E"] - scored["rent_prev"]) / scored["rent_prev"].clip(lower=1)) * 100
+        # Income growth (positive = tenants can afford more)
+        scored["income_growth"] = ((scored["B19013_001E"] - scored["income_prev"]) / scored["income_prev"].clip(lower=1)) * 100
+        # Young adult growth
+        scored["youth_growth"] = scored["pct2534"] - scored["pct2534_prev"]
+        # Normalize momentum signals
+        for mc in ["rent_growth", "income_growth", "youth_growth"]:
+            scored[mc] = scored[mc].clip(-50, 50)  # cap outliers
+            mn, mx = scored[mc].min(), scored[mc].max()
+            scored[f"{mc}_n"] = (scored[mc] - mn) / (mx - mn + 0.01)
+        scored["momentum"] = (scored["rent_growth_n"] * 0.4 + scored["income_growth_n"] * 0.35 + scored["youth_growth_n"] * 0.25)
+    else:
+        scored["momentum"] = 0.5
+        scored["rent_growth"] = np.nan
+        scored["income_growth"] = np.nan
+        scored["youth_growth"] = np.nan
+
+    # -- Affordability Headroom: low r2i = room to raise rents --
+    scored["headroom"] = 1 - (scored["r2i"].clip(0, 60) / 60)
+    hr_min, hr_max = scored["headroom"].min(), scored["headroom"].max()
+    scored["headroom_n"] = (scored["headroom"] - hr_min) / (hr_max - hr_min + 0.01)
+
+    # -- Macro Alignment --
+    macro_boost = 0.5  # neutral default
+    if macro_forecasts:
+        signals = []
+        # If permits forecast up → construction/supply signal
+        if "Permits (Annual)" in macro_forecasts:
+            pf = macro_forecasts["Permits (Annual)"]
+            if pf and pf.get("forecast_val", 0) > pf.get("last_actual_val", 0):
+                signals.append(0.6)
+            else:
+                signals.append(0.4)
+        # If GDP forecast up → demand signal
+        if "GDP ($M)" in macro_forecasts:
+            gf = macro_forecasts["GDP ($M)"]
+            if gf and gf.get("forecast_val", 0) > gf.get("last_actual_val", 0):
+                signals.append(0.7)
+            else:
+                signals.append(0.3)
+        # If unemployment forecast down → demand signal
+        if "Unemployment (%)" in macro_forecasts:
+            uf = macro_forecasts["Unemployment (%)"]
+            if uf and uf.get("forecast_val", 0) < uf.get("last_actual_val", 0):
+                signals.append(0.7)
+            else:
+                signals.append(0.3)
+        if signals:
+            macro_boost = np.mean(signals)
+    scored["macro_n"] = macro_boost
+
+    # -- Composite Score --
+    scored["opp_pred"] = (
+        scored["fund_n"] * 0.40 +
+        scored["momentum"] * 0.30 +
+        scored["headroom_n"] * 0.20 +
+        scored["macro_n"] * 0.10
+    ) * 100
+
+    return scored
 
 # ── PAGE SETUP ──
 st.set_page_config(page_title="Lapstone Intel — Philly Dashboard", page_icon="🏗️", layout="wide", initial_sidebar_state="expanded")
@@ -763,6 +855,124 @@ with t_fc:
 
 **Limitations:** Annual frequency limits sample size. Model assumes linear relationships and stable regime. Structural breaks (pandemics, policy shifts) may not be captured. GDP data lags ~1 year from BEA.
 """)
+
+        # ── OPPORTUNITY AREA PREDICTION ──
+        st.markdown('<div class="section-label">🎯 Opportunity Area Prediction</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="info-box">{tip("opp_pred")}</div>', unsafe_allow_html=True)
+
+        if CENSUS_API_KEY:
+            # Collect macro forecast results for alignment signal
+            macro_results = {}
+            for tl, tk in targets.items():
+                if tk in annual.columns:
+                    r = run_forecast(annual, tk)
+                    if r: macro_results[tl] = r
+
+            opp_counties = st.multiselect("Counties to score", [k for k,v in COUNTY_FIPS.items() if v[0]=="42"],
+                default=["Philadelphia"], key="opp_mc")
+            opp_fips = {k: v for k, v in COUNTY_FIPS.items() if k in opp_counties and v[0] == "42"}
+
+            if opp_fips:
+                with st.spinner("Loading tract data for opportunity scoring…"):
+                    tracts_curr = fetch_multi_tracts(TRACT_VARS, opp_fips, year=2023)
+                    tracts_prev = fetch_multi_tracts(TRACT_VARS, opp_fips, year=2022)
+
+                if not tracts_curr.empty:
+                    tracts_curr = compute_tract_metrics(tracts_curr)
+                    tracts_curr["GEOID"] = tracts_curr["state"] + tracts_curr["county"] + tracts_curr["tract"]
+
+                    opp = compute_tract_opportunity(tracts_curr, tracts_prev, macro_results)
+
+                    if not opp.empty:
+                        top_n = st.slider("Top tracts to display", 10, 50, 25, key="opp_n")
+                        top = opp.nlargest(top_n, "opp_pred").copy()
+                        top["lbl"] = top["NAME"].str.replace(r"Census Tract (\d+\.?\d*),.*", r"Tract \1", regex=True)
+
+                        # Summary metrics
+                        om1, om2, om3, om4 = st.columns(4)
+                        with om1: st.metric("Top Score", f"{top['opp_pred'].max():.1f}/100")
+                        with om2: st.metric("Median Score (Top)", f"{top['opp_pred'].median():.1f}/100")
+                        with om3: st.metric(f"Tracts Scored", f"{len(opp):,}")
+                        with om4:
+                            macro_dir = "📈 Favorable" if np.mean([r.get("forecast_val",0) > r.get("last_actual_val",0) for r in macro_results.values() if r]) > 0.5 else "📉 Cautious"
+                            st.metric("Macro Outlook", macro_dir)
+
+                        # Map
+                        geo = load_geojson("42")
+                        if geo:
+                            cfset = set(tracts_curr["state"] + tracts_curr["county"])
+                            fgeo = {"type": "FeatureCollection", "features": [
+                                f for f in geo["features"] if f["properties"]["STATEFP"]+f["properties"]["COUNTYFP"] in cfset]}
+                            zoom = 10.5 if len(opp_counties) == 1 else (9.5 if len(opp_counties) <= 3 else 8.5)
+                            fig = go.Figure(go.Choroplethmapbox(
+                                geojson=fgeo, locations=opp["GEOID"], z=opp["opp_pred"],
+                                featureidkey="properties.GEOID", text=opp["NAME"],
+                                colorscale=[[0, C["slate"]], [0.4, C["teal"]], [0.7, C["gold"]], [1, C["coral"]]],
+                                marker_opacity=0.8, marker_line_width=0.5,
+                                marker_line_color="rgba(255,255,255,0.15)",
+                                colorbar=dict(title=dict(text="Opp Score", font=dict(size=11)),
+                                    tickfont=dict(size=10), len=0.6),
+                                hovertemplate="<b>%{text}</b><br>Opportunity: %{z:.1f}/100<extra></extra>"))
+                            fig.update_layout(
+                                mapbox=dict(style="carto-darkmatter", center=dict(lat=39.99, lon=-75.16), zoom=zoom),
+                                paper_bgcolor="rgba(0,0,0,0)", font=dict(color=C["text"], family="DM Sans"),
+                                margin=dict(l=0, r=0, t=50, b=0),
+                                title=dict(text="Opportunity Area Prediction — Next Year", font=dict(size=16, color=C["text"])), height=620)
+                            st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True, "displayModeBar": True})
+
+                        # Bar chart: top tracts
+                        fig = go.Figure(go.Bar(
+                            y=top["lbl"].tolist()[::-1], x=top["opp_pred"].tolist()[::-1],
+                            orientation="h",
+                            marker=dict(color=top["opp_pred"].tolist()[::-1],
+                                colorscale=[[0, C["teal"]], [1, C["gold"]]]),
+                            hovertemplate="<b>%{y}</b><br>Score: %{x:.1f}/100<extra></extra>"))
+                        fig.update_layout(**BL, title=dict(text=f"Top {top_n} Opportunity Tracts", font=dict(size=16)),
+                            xaxis_title="Opportunity Score", height=max(400, top_n * 22))
+                        st.plotly_chart(fig, use_container_width=True)
+
+                        # Detailed table
+                        with st.expander(f"📋 Top {top_n} Tracts — Full Breakdown"):
+                            show_cols = ["lbl", "opp_pred", "score", "B25064_001E", "B19013_001E",
+                                         "r2i", "pct2534", "renter_pct"]
+                            rename = {"lbl": "Tract", "opp_pred": "Opp Score", "score": "Demand Score",
+                                      "B25064_001E": "Rent", "B19013_001E": "Income",
+                                      "r2i": "Rent/Inc %", "pct2534": "% 25-34", "renter_pct": "% Renters"}
+                            extra_cols = {}
+                            if "rent_growth" in top.columns:
+                                show_cols.extend(["rent_growth", "income_growth", "youth_growth"])
+                                extra_cols = {"rent_growth": "Rent Δ%", "income_growth": "Income Δ%", "youth_growth": "Youth Δpp"}
+                            rename.update(extra_cols)
+                            tbl = top[[c for c in show_cols if c in top.columns]].rename(columns=rename)
+                            fmt = {"Opp Score": "{:.1f}", "Demand Score": "{:.0f}", "Rent": "${:,.0f}",
+                                   "Income": "${:,.0f}", "Rent/Inc %": "{:.1f}%", "% 25-34": "{:.1f}%",
+                                   "% Renters": "{:.1f}%"}
+                            if "Rent Δ%" in tbl.columns:
+                                fmt.update({"Rent Δ%": "{:+.1f}%", "Income Δ%": "{:+.1f}%", "Youth Δpp": "{:+.1f}pp"})
+                            st.dataframe(tbl.style.format({k: v for k, v in fmt.items() if k in tbl.columns}),
+                                use_container_width=True, hide_index=True)
+
+                        # Score decomposition
+                        with st.expander("📖 Score Methodology"):
+                            st.markdown("""
+**Opportunity Area Prediction Score** (0–100) combines four signals:
+
+| Component | Weight | What It Measures |
+|-----------|--------|-----------------|
+| **Fundamentals** | 40% | Current demand score (young adults, renters, affordability) |
+| **Momentum** | 30% | Year-over-year improvement in rent, income, and young adult share (ACS 2022→2023) |
+| **Affordability Headroom** | 20% | Low rent-to-income ratio = room for rent increases without burdening tenants |
+| **Macro Alignment** | 10% | Whether FRED macro forecasts (GDP↑, unemployment↓, permits↑) are favorable |
+
+**Interpretation:**
+- **75+**: High-opportunity — strong fundamentals AND improving trajectory
+- **60–75**: Moderate — solid base, watch for momentum shifts
+- **Below 60**: Lower priority — may have affordability issues or declining demographics
+
+**Data Sources:** Census ACS 5-Year (2022, 2023), FRED macro indicators, Ridge regression forecasts
+""")
+        else:
+            st.info("👈 Enter Census API key to enable opportunity prediction.")
 
 # ── FOOTER ──
 st.markdown("---")
