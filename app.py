@@ -222,6 +222,8 @@ def run_forecast(annual, target_col, n_backtest=5):
     lagged = df[feature_cols].shift(1)
     lagged.columns = [f"{c}_lag1" for c in feature_cols]
     combo = pd.concat([df[[target_col]], lagged], axis=1).dropna()
+    # Drop any feature columns that still have NaN
+    combo = combo.dropna(axis=1)
     if len(combo) < 6: return None
     X = combo.drop(columns=[target_col])
     y = combo[target_col]
@@ -246,6 +248,9 @@ def run_forecast(annual, target_col, n_backtest=5):
     sc = StandardScaler(); X_s = sc.fit_transform(X); m = Ridge(alpha=1.0); m.fit(X_s, y)
     last_row = df[feature_cols].iloc[-1:].copy()
     last_row.columns = [f"{c}_lag1" for c in feature_cols]
+    # Only use columns that survived NaN filtering
+    last_row = last_row[[c for c in feat_names if c in last_row.columns]]
+    last_row = last_row.fillna(last_row.mean())
     forecast_val = m.predict(sc.transform(last_row))[0]
     forecast_year = int(df.index[-1]) + 1
     # Confidence interval from backtest residuals
