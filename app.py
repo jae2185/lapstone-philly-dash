@@ -209,24 +209,18 @@ def build_annual_dataset(fd):
         frames[key] = agg
     if not frames: return pd.DataFrame(), targets
     annual = pd.concat(frames.values(), axis=1).dropna(how="all")
-    # Exclude current incomplete year to avoid partial-year bias
-    from datetime import datetime
-    current_year = datetime.now().year
-    annual = annual[annual.index < current_year]
     return annual, targets
 
-def run_forecast(annual, target_col, n_backtest=5):
-    """Walk-forward expanding-window Ridge regression forecast."""
+def run_forecast(annual, target_col, n_backtest=5, horizons=(1, 2, 5)):
+    """Walk-forward Ridge regression with multi-year iterative forecasting."""
     from sklearn.linear_model import Ridge
     from sklearn.preprocessing import StandardScaler
     if target_col not in annual.columns or len(annual) < 8:
         return None
-    # Clean: forward-fill gaps, back-fill edges, drop any remaining NaN columns
     clean = annual.ffill().bfill().dropna(axis=1)
     if target_col not in clean.columns or len(clean) < 8:
         return None
     feature_cols = [c for c in clean.columns]
-    # Create 1-year lag features
     lagged = clean.shift(1)
     lagged.columns = [f"{c}_lag1" for c in feature_cols]
     combo = pd.concat([clean[[target_col]], lagged], axis=1).iloc[1:]
@@ -251,23 +245,49 @@ def run_forecast(annual, target_col, n_backtest=5):
     bt["abs_pct_error"] = (bt["error"].abs() / bt["actual"].abs().clip(lower=0.01)) * 100
     mape = bt["abs_pct_error"].mean()
     rmse = np.sqrt((bt["error"]**2).mean())
-    # Final forecast
+    std_err = bt["error"].std() if len(bt) > 1 else abs(y.iloc[-1]) * 0.05
+    # Train final model on all data
     sc = StandardScaler(); X_s = sc.fit_transform(X); m = Ridge(alpha=1.0); m.fit(X_s, y)
-    last_vals = clean[feature_cols].iloc[-1:].copy()
-    last_vals.columns = [f"{c}_lag1" for c in feature_cols]
-    last_vals = last_vals[feat_names].fillna(0)
-    forecast_val = m.predict(sc.transform(last_vals))[0]
-    forecast_year = int(clean.index[-1]) + 1
-    std_err = bt["error"].std() if len(bt) > 1 else abs(forecast_val) * 0.05
-    ci_low = forecast_val - 1.96 * std_err
-    ci_high = forecast_val + 1.96 * std_err
     coefs = pd.Series(m.coef_, index=feat_names).abs().sort_values(ascending=False)
+    # Multi-horizon iterative forecast
+    # Feed each prediction back as "last known" to predict the next year
+    last_known = clean[feature_cols].iloc[-1:].copy()  # most recent actual values
+    base_year = int(clean.index[-1])
+    forecasts = []  # list of {year, value, ci_low, ci_high}
+    simulated_row = last_known.copy()
+    for h in range(1, max(horizons) + 1):
+        inp = simulated_row.copy()
+        inp.columns = [f"{c}_lag1" for c in feature_cols]
+        inp = inp[feat_names].fillna(0)
+        pred = m.predict(sc.transform(inp))[0]
+        # CI widens with sqrt(horizon) — uncertainty compounds
+        ci_mult = 1.96 * np.sqrt(h)
+        forecasts.append({
+            "year": base_year + h, "value": pred,
+            "ci_low": pred - ci_mult * std_err,
+            "ci_high": pred + ci_mult * std_err,
+            "horizon": h,
+        })
+        # Update simulated row: replace target col with prediction, keep others trending
+        simulated_row = simulated_row.copy()
+        if target_col in simulated_row.columns:
+            simulated_row[target_col] = pred
+    fc_df = pd.DataFrame(forecasts)
+    # Extract specific horizon results
+    horizon_results = {}
+    for h in horizons:
+        row = fc_df[fc_df["horizon"] == h]
+        if not row.empty:
+            r = row.iloc[0]
+            horizon_results[h] = {
+                "year": int(r["year"]), "value": r["value"],
+                "ci_low": r["ci_low"], "ci_high": r["ci_high"],
+            }
     return {
         "backtest": bt, "mape": mape, "rmse": rmse,
-        "forecast_year": forecast_year, "forecast_val": forecast_val,
-        "ci_low": ci_low, "ci_high": ci_high,
-        "last_actual_year": int(clean.index[-1]), "last_actual_val": y.iloc[-1],
-        "importance": coefs, "n_train": len(combo),
+        "forecasts": fc_df, "horizon_results": horizon_results,
+        "last_actual_year": base_year, "last_actual_val": y.iloc[-1],
+        "importance": coefs, "n_train": len(combo), "std_err": std_err,
     }
 
 # ── OPPORTUNITY AREA PREDICTION ──
@@ -791,13 +811,9 @@ with t_fc:
                     st.markdown("_Insufficient data for this forecast._")
                     continue
 
-                # Metrics row
-                fc1, fc2, fc3, fc4 = st.columns(4)
+                # Format helper
                 is_dollar = "$" in target_label
                 is_pct = "%" in target_label
-                pref = "$" if is_dollar else ""
-                suf = "%" if is_pct else ""
-
                 def fv(v):
                     if is_dollar and abs(v) >= 1e6: return f"${v/1e6:,.0f}M"
                     if is_dollar and abs(v) >= 1e3: return f"${v/1e3:,.0f}K"
@@ -805,40 +821,58 @@ with t_fc:
                     if is_pct: return f"{v:.1f}%"
                     return f"{v:,.0f}"
 
-                chg = result["forecast_val"] - result["last_actual_val"]
-                chg_pct = (chg / abs(result["last_actual_val"])) * 100 if result["last_actual_val"] != 0 else 0
+                hr = result["horizon_results"]
 
-                with fc1: st.metric(f"{result['last_actual_year']} (Actual)", fv(result["last_actual_val"]))
-                with fc2: st.metric(f"{result['forecast_year']} (Forecast)", fv(result["forecast_val"]),
-                    f"{chg_pct:+.1f}%", delta_color="normal" if not is_pct else ("inverse" if "Unemployment" in target_label else "normal"))
-                with fc3: st.metric("95% CI", f"{fv(result['ci_low'])} – {fv(result['ci_high'])}")
-                with fc4: st.metric("Backtest MAPE", f"{result['mape']:.1f}%", help="Mean Absolute Percentage Error on walk-forward backtest. Lower = more accurate.")
+                # Metrics: Actual + 1yr, 2yr, 5yr forecasts
+                fc1, fc2, fc3, fc4, fc5 = st.columns(5)
+                with fc1:
+                    st.metric(f"{result['last_actual_year']} (Actual)", fv(result["last_actual_val"]))
+                for col, h, label in [(fc2, 1, "1-Year"), (fc3, 2, "2-Year"), (fc4, 5, "5-Year")]:
+                    with col:
+                        if h in hr:
+                            chg_pct = ((hr[h]["value"] - result["last_actual_val"]) / abs(result["last_actual_val"])) * 100 if result["last_actual_val"] != 0 else 0
+                            dc = "normal" if not is_pct else ("inverse" if "Unemployment" in target_label else "normal")
+                            st.metric(f"{hr[h]['year']} ({label})", fv(hr[h]["value"]),
+                                f"{chg_pct:+.1f}%", delta_color=dc,
+                                help=f"95% CI: {fv(hr[h]['ci_low'])} – {fv(hr[h]['ci_high'])}")
+                with fc5:
+                    st.metric("Backtest MAPE", f"{result['mape']:.1f}%",
+                        help="Mean Absolute Percentage Error on walk-forward backtest. Lower = more accurate.")
 
-                # Charts: backtest + forecast
+                # Charts
                 bt = result["backtest"]
+                fc_df = result["forecasts"]
                 ch1, ch2 = st.columns(2)
                 with ch1:
                     fig = go.Figure()
+                    # Actuals from backtest
                     fig.add_trace(go.Scatter(x=bt["year"], y=bt["actual"], mode="lines+markers",
                         name="Actual", line=dict(color=C["teal"], width=2.5), marker=dict(size=6)))
                     fig.add_trace(go.Scatter(x=bt["year"], y=bt["predicted"], mode="lines+markers",
-                        name="Predicted", line=dict(color=C["gold"], width=2, dash="dash"), marker=dict(size=6, symbol="diamond")))
-                    # Add forecast point
-                    fig.add_trace(go.Scatter(x=[result["forecast_year"]], y=[result["forecast_val"]],
-                        mode="markers", name=f"{result['forecast_year']} Forecast",
-                        marker=dict(size=12, color=C["coral"], symbol="star")))
-                    # CI band
-                    fig.add_shape(type="rect", x0=result["forecast_year"]-0.3, x1=result["forecast_year"]+0.3,
-                        y0=result["ci_low"], y1=result["ci_high"],
-                        fillcolor="rgba(231,111,81,0.15)", line=dict(width=0))
+                        name="Backtest Pred", line=dict(color=C["gold"], width=2, dash="dash"), marker=dict(size=6, symbol="diamond")))
+                    # Forecast line with CI band
+                    fig.add_trace(go.Scatter(x=fc_df["year"], y=fc_df["ci_high"],
+                        mode="lines", line=dict(width=0), showlegend=False, hoverinfo="skip"))
+                    fig.add_trace(go.Scatter(x=fc_df["year"], y=fc_df["ci_low"],
+                        mode="lines", line=dict(width=0), fill="tonexty",
+                        fillcolor="rgba(231,111,81,0.12)", showlegend=False, hoverinfo="skip"))
+                    fig.add_trace(go.Scatter(x=fc_df["year"], y=fc_df["value"], mode="lines+markers",
+                        name="Forecast", line=dict(color=C["coral"], width=2.5),
+                        marker=dict(size=8, symbol="star"),
+                        hovertemplate="<b>%{x}</b><br>Forecast: " + ("$" if is_dollar else "") + "%{y:,.1f}" + ("%" if is_pct else "") + "<extra></extra>"))
+                    # Mark specific horizons
+                    for h in [1, 2, 5]:
+                        if h in hr:
+                            fig.add_annotation(x=hr[h]["year"], y=hr[h]["value"],
+                                text=f"{h}yr", showarrow=True, arrowhead=2, arrowcolor=C["gold"],
+                                font=dict(size=10, color=C["gold"]), ax=0, ay=-25)
                     fmt = {}
                     if is_dollar: fmt["yaxis_tickprefix"] = "$"
                     if is_pct: fmt["yaxis_ticksuffix"] = "%"
-                    fig.update_layout(**BL, title=dict(text=f"Backtest + Forecast: {target_label}", font=dict(size=14)), **fmt)
+                    fig.update_layout(**BL, title=dict(text=f"{target_label} — Backtest + Multi-Year Forecast", font=dict(size=14)), **fmt)
                     st.plotly_chart(fig, use_container_width=True)
 
                 with ch2:
-                    # Feature importance
                     imp = result["importance"].head(6)
                     clean_names = [n.replace("_lag1","").replace("_"," ").title() for n in imp.index]
                     fig = go.Figure(go.Bar(y=clean_names[::-1], x=imp.values[::-1], orientation="h",
@@ -856,7 +890,9 @@ with t_fc:
 
 **Validation:** Expanding-window walk-forward backtest — the model is retrained at each step using only data available up to that point, then predicts the next year. This prevents data leakage and simulates real-world forecasting conditions.
 
-**Confidence Interval:** 95% CI derived from the standard deviation of backtest residuals (±1.96σ)
+**Confidence Interval:** 95% CI derived from backtest residuals, widening with √horizon (uncertainty compounds over time)
+
+**Multi-Year Forecast:** Iterative approach — each year's prediction feeds back as input for the next year. The 1-year forecast is most reliable; 5-year forecasts carry substantially more uncertainty (reflected in wider CI bands).
 
 **MAPE:** Mean Absolute Percentage Error across all backtest windows. Under 5% is excellent; under 10% is good.
 
@@ -873,7 +909,11 @@ with t_fc:
             for tl, tk in targets.items():
                 if tk in annual.columns:
                     r = run_forecast(annual, tk)
-                    if r: macro_results[tl] = r
+                    if r and r.get("horizon_results") and 1 in r["horizon_results"]:
+                        macro_results[tl] = {
+                            "forecast_val": r["horizon_results"][1]["value"],
+                            "last_actual_val": r["last_actual_val"],
+                        }
 
             opp_counties = st.multiselect("Counties to score", [k for k,v in COUNTY_FIPS.items() if v[0]=="42"],
                 default=["Philadelphia"], key="opp_mc")
