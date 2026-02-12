@@ -216,14 +216,16 @@ def run_forecast(annual, target_col, n_backtest=5):
     from sklearn.preprocessing import StandardScaler
     if target_col not in annual.columns or len(annual) < 8:
         return None
-    df = annual.dropna(subset=[target_col]).copy()
-    # Create lag features (1-year lag of all available columns)
-    feature_cols = [c for c in df.columns]
-    lagged = df[feature_cols].shift(1)
+    # Forward-fill then drop remaining NaN to build clean annual matrix
+    clean = annual.ffill().bfill().dropna(axis=1)
+    if target_col not in clean.columns or len(clean) < 8:
+        return None
+    feature_cols = [c for c in clean.columns]
+    # Create 1-year lag features
+    lagged = clean.shift(1)
     lagged.columns = [f"{c}_lag1" for c in feature_cols]
-    combo = pd.concat([df[[target_col]], lagged], axis=1).dropna()
-    # Drop any feature columns that still have NaN
-    combo = combo.dropna(axis=1)
+    combo = pd.concat([clean[[target_col]], lagged], axis=1).iloc[1:]  # drop first row (NaN from shift)
+    combo = combo.replace([np.inf, -np.inf], np.nan).dropna()
     if len(combo) < 6: return None
     X = combo.drop(columns=[target_col])
     y = combo[target_col]
@@ -241,29 +243,25 @@ def run_forecast(annual, target_col, n_backtest=5):
     bt = pd.DataFrame(bt_results)
     if bt.empty: return None
     bt["error"] = bt["predicted"] - bt["actual"]
-    bt["abs_pct_error"] = (bt["error"].abs() / bt["actual"].abs()) * 100
+    bt["abs_pct_error"] = (bt["error"].abs() / bt["actual"].abs().clip(lower=0.01)) * 100
     mape = bt["abs_pct_error"].mean()
     rmse = np.sqrt((bt["error"]**2).mean())
-    # Final forecast: train on ALL data, predict next year
+    # Final forecast
     sc = StandardScaler(); X_s = sc.fit_transform(X); m = Ridge(alpha=1.0); m.fit(X_s, y)
-    last_row = df[feature_cols].iloc[-1:].copy()
-    last_row.columns = [f"{c}_lag1" for c in feature_cols]
-    # Only use columns that survived NaN filtering
-    last_row = last_row[[c for c in feat_names if c in last_row.columns]]
-    last_row = last_row.fillna(last_row.mean())
-    forecast_val = m.predict(sc.transform(last_row))[0]
-    forecast_year = int(df.index[-1]) + 1
-    # Confidence interval from backtest residuals
-    std_err = bt["error"].std()
+    last_vals = clean[feature_cols].iloc[-1:].copy()
+    last_vals.columns = [f"{c}_lag1" for c in feature_cols]
+    last_vals = last_vals[feat_names].fillna(0)
+    forecast_val = m.predict(sc.transform(last_vals))[0]
+    forecast_year = int(clean.index[-1]) + 1
+    std_err = bt["error"].std() if len(bt) > 1 else abs(forecast_val) * 0.05
     ci_low = forecast_val - 1.96 * std_err
     ci_high = forecast_val + 1.96 * std_err
-    # Feature importance
     coefs = pd.Series(m.coef_, index=feat_names).abs().sort_values(ascending=False)
     return {
         "backtest": bt, "mape": mape, "rmse": rmse,
         "forecast_year": forecast_year, "forecast_val": forecast_val,
         "ci_low": ci_low, "ci_high": ci_high,
-        "last_actual_year": int(df.index[-1]), "last_actual_val": y.iloc[-1],
+        "last_actual_year": int(clean.index[-1]), "last_actual_val": y.iloc[-1],
         "importance": coefs, "n_train": len(combo),
     }
 
