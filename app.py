@@ -292,42 +292,25 @@ def build_annual_dataset(fd, migration_df=None):
     annual = annual[annual.index < current_year]
     return annual, targets
 
-def run_forecast(annual, target_col, n_backtest=5, horizons=(1, 2, 5)):
-    """Walk-forward Ridge regression with multi-horizon iterative forecasting and backtesting."""
-    from sklearn.linear_model import Ridge
+def _run_single_forecast(clean, target_col, feature_cols, n_backtest=5, horizons=(1, 2, 5), detrend=False):
+    """Core forecast engine. If detrend=True, removes linear trend before modeling."""
+    from sklearn.linear_model import Ridge, LinearRegression
     from sklearn.preprocessing import StandardScaler
-    if target_col not in annual.columns or len(annual) < 8:
-        return None
 
-    # Smart feature selection: only include migration features if they don't cost
-    # too many training observations. Migration data starts ~2010, FRED goes to ~2001.
-    migration_cols = ["inflow_rate", "turnover_rate", "out_of_state_rate"]
-    mig_available = [c for c in migration_cols if c in annual.columns]
+    y_raw = clean[target_col].copy()
+    trend_coef, trend_intercept = 0.0, 0.0
 
-    if mig_available:
-        # Count how many rows we'd lose by including migration
-        without_mig = annual.drop(columns=mig_available, errors="ignore").ffill().bfill().dropna(axis=1)
-        with_mig = annual.ffill().bfill().dropna(axis=1)
+    if detrend:
+        # Fit linear trend on target
+        t = np.arange(len(y_raw)).reshape(-1, 1)
+        lr = LinearRegression().fit(t, y_raw.values)
+        trend_coef = lr.coef_[0]
+        trend_intercept = lr.intercept_
+        trend_line = lr.predict(t)
+        # Detrend: model predicts residuals from trend
+        clean = clean.copy()
+        clean[target_col] = y_raw.values - trend_line
 
-        n_without = len(without_mig.dropna())
-        n_with = len(with_mig.dropna())
-        rows_lost = n_without - n_with
-
-        # Only include migration if we retain at least 12 observations
-        # and don't lose more than 30% of our training data
-        if n_with >= 12 and rows_lost <= n_without * 0.3:
-            clean = with_mig
-            used_migration = True
-        else:
-            clean = without_mig
-            used_migration = False
-    else:
-        clean = annual.ffill().bfill().dropna(axis=1)
-        used_migration = False
-
-    if target_col not in clean.columns or len(clean) < 8:
-        return None
-    feature_cols = [c for c in clean.columns]
     lagged = clean.shift(1)
     lagged.columns = [f"{c}_lag1" for c in feature_cols]
     combo = pd.concat([clean[[target_col]], lagged], axis=1).iloc[1:]
@@ -337,45 +320,45 @@ def run_forecast(annual, target_col, n_backtest=5, horizons=(1, 2, 5)):
     y = combo[target_col]
     feat_names = X.columns.tolist()
 
-    # ── Multi-horizon walk-forward backtest ──
-    # For each split point, train model, then iteratively predict 1, 2, ... max(horizons) years ahead
     max_h = max(horizons)
-    bt_all = []  # rows: {year_origin, horizon, predicted, actual}
+    bt_all = []
     min_train = max(5, len(combo) - n_backtest - max_h)
     for split in range(min_train, len(combo) - 1):
         X_tr, y_tr = X.iloc[:split], y.iloc[:split]
         sc_bt = StandardScaler(); X_tr_s = sc_bt.fit_transform(X_tr)
         m_bt = Ridge(alpha=1.0); m_bt.fit(X_tr_s, y_tr)
-        # Iterative multi-step prediction from this split
-        sim_row = clean[feature_cols].iloc[split - 1 + 1:split + 1].copy()  # row at split index in clean
+        sim_row = clean[feature_cols].iloc[split - 1 + 1:split + 1].copy()
         if sim_row.empty: continue
         sim_row = sim_row.iloc[-1:].copy()
         for h in range(1, max_h + 1):
-            future_idx = split + h - 1  # index into combo
+            future_idx = split + h - 1
             if future_idx >= len(combo): break
             inp = sim_row.copy()
             inp.columns = [f"{c}_lag1" for c in feature_cols]
             inp = inp[feat_names].fillna(0)
             pred_h = m_bt.predict(sc_bt.transform(inp))[0]
-            actual_h = y.iloc[future_idx] if future_idx < len(y) else None
+            # Re-add trend for comparison against actuals
+            if detrend:
+                trend_at_target = trend_coef * (split + h) + trend_intercept
+                pred_actual = pred_h + trend_at_target
+            else:
+                pred_actual = pred_h
+            actual_h = y_raw.iloc[split + h] if (split + h) < len(y_raw) else None
             if actual_h is not None:
                 bt_all.append({
                     "year_origin": y.index[split - 1] if split > 0 else y.index[0],
                     "year_target": y.index[future_idx],
-                    "horizon": h, "predicted": pred_h, "actual": actual_h,
+                    "horizon": h, "predicted": pred_actual, "actual": actual_h,
                 })
-            # Feed prediction back
             sim_row = sim_row.copy()
             if target_col in sim_row.columns:
-                sim_row[target_col] = pred_h
+                sim_row[target_col] = pred_h  # feed back detrended prediction
 
     bt_full = pd.DataFrame(bt_all)
     if bt_full.empty: return None
-
     bt_full["error"] = bt_full["predicted"] - bt_full["actual"]
     bt_full["abs_pct_error"] = (bt_full["error"].abs() / bt_full["actual"].abs().clip(lower=0.01)) * 100
 
-    # Per-horizon accuracy
     horizon_accuracy = {}
     for h in horizons:
         bh = bt_full[bt_full["horizon"] == h]
@@ -386,20 +369,20 @@ def run_forecast(annual, target_col, n_backtest=5, horizons=(1, 2, 5)):
                 "n": len(bh),
             }
 
-    # 1-year backtest for display (backward compat)
     bt1 = bt_full[bt_full["horizon"] == 1].copy()
     bt1 = bt1.rename(columns={"year_target": "year"})
     mape = bt1["abs_pct_error"].mean() if not bt1.empty else 0
     rmse = np.sqrt((bt1["error"] ** 2).mean()) if not bt1.empty else 0
-    std_err = bt1["error"].std() if len(bt1) > 1 else abs(y.iloc[-1]) * 0.05
+    std_err = bt1["error"].std() if len(bt1) > 1 else abs(y_raw.iloc[-1]) * 0.05
 
     # Train final model on all data
     sc = StandardScaler(); X_s = sc.fit_transform(X); m = Ridge(alpha=1.0); m.fit(X_s, y)
     coefs = pd.Series(m.coef_, index=feat_names).abs().sort_values(ascending=False)
 
-    # Multi-horizon iterative forecast
+    # Multi-horizon forecast
     last_known = clean[feature_cols].iloc[-1:].copy()
     base_year = int(clean.index[-1])
+    n_total = len(y_raw)
     forecasts = []
     simulated_row = last_known.copy()
     for h in range(1, max_h + 1):
@@ -407,15 +390,17 @@ def run_forecast(annual, target_col, n_backtest=5, horizons=(1, 2, 5)):
         inp.columns = [f"{c}_lag1" for c in feature_cols]
         inp = inp[feat_names].fillna(0)
         pred = m.predict(sc.transform(inp))[0]
-        ci_mult = 1.96 * np.sqrt(h)
-        # Use horizon-specific std_err if available
+        if detrend:
+            pred_actual = pred + trend_coef * (n_total + h) + trend_intercept
+        else:
+            pred_actual = pred
         h_err = std_err
         if h in horizon_accuracy and horizon_accuracy[h]["n"] > 1:
             bh = bt_full[bt_full["horizon"] == h]
             h_err = bh["error"].std()
         forecasts.append({
-            "year": base_year + h, "value": pred,
-            "ci_low": pred - 1.96 * h_err, "ci_high": pred + 1.96 * h_err,
+            "year": base_year + h, "value": pred_actual,
+            "ci_low": pred_actual - 1.96 * h_err, "ci_high": pred_actual + 1.96 * h_err,
             "horizon": h,
         })
         simulated_row = simulated_row.copy()
@@ -432,15 +417,86 @@ def run_forecast(annual, target_col, n_backtest=5, horizons=(1, 2, 5)):
                 "year": int(r["year"]), "value": r["value"],
                 "ci_low": r["ci_low"], "ci_high": r["ci_high"],
             }
+
+    # Compute weighted MAPE across all horizons for model selection
+    weighted_mape = 0
+    total_w = 0
+    for h, w in [(1, 3), (2, 2), (5, 1)]:  # weight short-term more heavily
+        if h in horizon_accuracy:
+            weighted_mape += horizon_accuracy[h]["mape"] * w
+            total_w += w
+    weighted_mape = weighted_mape / total_w if total_w > 0 else mape
+
     return {
         "backtest": bt1, "backtest_full": bt_full,
         "horizon_accuracy": horizon_accuracy,
-        "mape": mape, "rmse": rmse,
+        "mape": mape, "rmse": rmse, "weighted_mape": weighted_mape,
         "forecasts": fc_df, "horizon_results": horizon_results,
-        "last_actual_year": base_year, "last_actual_val": y.iloc[-1],
+        "last_actual_year": base_year, "last_actual_val": y_raw.iloc[-1],
         "importance": coefs, "n_train": len(combo), "std_err": std_err,
-        "used_migration": used_migration,
+        "detrended": detrend,
+        "trend_coef": trend_coef, "trend_intercept": trend_intercept,
     }
+
+def run_forecast(annual, target_col, n_backtest=5, horizons=(1, 2, 5)):
+    """Run both standard and trend-adjusted forecasts, auto-select the better model by backtest."""
+    from sklearn.linear_model import Ridge
+    from sklearn.preprocessing import StandardScaler
+    if target_col not in annual.columns or len(annual) < 8:
+        return None
+
+    # Smart feature selection: only include migration features if they don't cost too many rows
+    migration_cols = ["inflow_rate", "turnover_rate", "out_of_state_rate"]
+    mig_available = [c for c in migration_cols if c in annual.columns]
+
+    if mig_available:
+        without_mig = annual.drop(columns=mig_available, errors="ignore").ffill().bfill().dropna(axis=1)
+        with_mig = annual.ffill().bfill().dropna(axis=1)
+        n_without = len(without_mig.dropna())
+        n_with = len(with_mig.dropna())
+        rows_lost = n_without - n_with
+        if n_with >= 12 and rows_lost <= n_without * 0.3:
+            clean = with_mig
+            used_migration = True
+        else:
+            clean = without_mig
+            used_migration = False
+    else:
+        clean = annual.ffill().bfill().dropna(axis=1)
+        used_migration = False
+
+    if target_col not in clean.columns or len(clean) < 8:
+        return None
+
+    feature_cols = [c for c in clean.columns]
+
+    # Run both models
+    result_standard = _run_single_forecast(clean, target_col, feature_cols, n_backtest, horizons, detrend=False)
+    result_trend = _run_single_forecast(clean, target_col, feature_cols, n_backtest, horizons, detrend=True)
+
+    # Select winner by weighted MAPE (favoring short-term accuracy)
+    if result_standard is None and result_trend is None:
+        return None
+    elif result_standard is None:
+        best = result_trend
+    elif result_trend is None:
+        best = result_standard
+    else:
+        if result_trend["weighted_mape"] < result_standard["weighted_mape"]:
+            best = result_trend
+        else:
+            best = result_standard
+
+    best["used_migration"] = used_migration
+    best["model_type"] = "trend-adjusted" if best.get("detrended") else "standard"
+    # Include comparison info
+    if result_standard and result_trend:
+        best["model_comparison"] = {
+            "standard_mape": result_standard["weighted_mape"],
+            "trend_mape": result_trend["weighted_mape"],
+            "selected": best["model_type"],
+        }
+    return best
 
 # ── OPPORTUNITY AREA PREDICTION ──
 @st.cache_data(ttl=3600*12, show_spinner=False)
@@ -1089,8 +1145,18 @@ with t_fc:
                                 help=f"95% CI: {fv(hr[h]['ci_low'])} – {fv(hr[h]['ci_high'])}")
                 with fc5:
                     mig_tag = " 🌍" if result.get("used_migration") else ""
-                    st.metric(f"Backtest MAPE{mig_tag}", f"{result['mape']:.1f}%",
-                        help=f"Mean Absolute Percentage Error on walk-forward backtest. Lower = more accurate.{' Migration features included.' if result.get('used_migration') else ' Migration features excluded (insufficient overlapping data).'}")
+                    model_tag = " 📈" if result.get("model_type") == "trend-adjusted" else ""
+                    st.metric(f"Backtest MAPE{mig_tag}{model_tag}", f"{result['mape']:.1f}%",
+                        help=f"Mean Absolute Percentage Error on walk-forward backtest. Lower = more accurate."
+                             f"{' Migration features included.' if result.get('used_migration') else ' Migration features excluded.'}"
+                             f" Model: {result.get('model_type', 'standard')}."
+                             f"{' (Trend-adjusted won backtest vs standard.)' if result.get('model_type') == 'trend-adjusted' else ''}")
+                    # Show model comparison if available
+                    mc = result.get("model_comparison")
+                    if mc:
+                        winner = mc["selected"]
+                        loser_mape = mc["trend_mape"] if winner == "standard" else mc["standard_mape"]
+                        st.caption(f"✓ {winner.title()} selected (wMAPE {result['weighted_mape']:.1f}% vs {loser_mape:.1f}%)")
 
                 # Charts
                 bt = result["backtest"]
