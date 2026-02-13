@@ -298,7 +298,33 @@ def run_forecast(annual, target_col, n_backtest=5, horizons=(1, 2, 5)):
     from sklearn.preprocessing import StandardScaler
     if target_col not in annual.columns or len(annual) < 8:
         return None
-    clean = annual.ffill().bfill().dropna(axis=1)
+
+    # Smart feature selection: only include migration features if they don't cost
+    # too many training observations. Migration data starts ~2010, FRED goes to ~2001.
+    migration_cols = ["inflow_rate", "turnover_rate", "out_of_state_rate"]
+    mig_available = [c for c in migration_cols if c in annual.columns]
+
+    if mig_available:
+        # Count how many rows we'd lose by including migration
+        without_mig = annual.drop(columns=mig_available, errors="ignore").ffill().bfill().dropna(axis=1)
+        with_mig = annual.ffill().bfill().dropna(axis=1)
+
+        n_without = len(without_mig.dropna())
+        n_with = len(with_mig.dropna())
+        rows_lost = n_without - n_with
+
+        # Only include migration if we retain at least 12 observations
+        # and don't lose more than 30% of our training data
+        if n_with >= 12 and rows_lost <= n_without * 0.3:
+            clean = with_mig
+            used_migration = True
+        else:
+            clean = without_mig
+            used_migration = False
+    else:
+        clean = annual.ffill().bfill().dropna(axis=1)
+        used_migration = False
+
     if target_col not in clean.columns or len(clean) < 8:
         return None
     feature_cols = [c for c in clean.columns]
@@ -413,6 +439,7 @@ def run_forecast(annual, target_col, n_backtest=5, horizons=(1, 2, 5)):
         "forecasts": fc_df, "horizon_results": horizon_results,
         "last_actual_year": base_year, "last_actual_val": y.iloc[-1],
         "importance": coefs, "n_train": len(combo), "std_err": std_err,
+        "used_migration": used_migration,
     }
 
 # ── OPPORTUNITY AREA PREDICTION ──
@@ -1022,7 +1049,8 @@ with t_fc:
         if annual.empty:
             st.warning("Not enough data to build forecasts.")
         else:
-            st.markdown(f"**{len(annual)} years** of annual data assembled ({int(annual.index.min())}–{int(annual.index.max())})")
+            mig_status = f" · Migration data: {len(migration_ts)} years ({int(migration_ts['year'].min())}–{int(migration_ts['year'].max())})" if not migration_ts.empty else " · No migration data"
+            st.markdown(f"**{len(annual)} years** of annual data assembled ({int(annual.index.min())}–{int(annual.index.max())}){mig_status}")
 
             for target_label, target_key in targets.items():
                 if target_key not in annual.columns:
@@ -1060,8 +1088,9 @@ with t_fc:
                                 f"{chg_pct:+.1f}%", delta_color=dc,
                                 help=f"95% CI: {fv(hr[h]['ci_low'])} – {fv(hr[h]['ci_high'])}")
                 with fc5:
-                    st.metric("Backtest MAPE", f"{result['mape']:.1f}%",
-                        help="Mean Absolute Percentage Error on walk-forward backtest. Lower = more accurate.")
+                    mig_tag = " 🌍" if result.get("used_migration") else ""
+                    st.metric(f"Backtest MAPE{mig_tag}", f"{result['mape']:.1f}%",
+                        help=f"Mean Absolute Percentage Error on walk-forward backtest. Lower = more accurate.{' Migration features included.' if result.get('used_migration') else ' Migration features excluded (insufficient overlapping data).'}")
 
                 # Charts
                 bt = result["backtest"]
