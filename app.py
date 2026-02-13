@@ -48,6 +48,18 @@ TRACT_VARS = [
     "B25064_001E","B19013_001E","B25003_001E","B25003_003E",
     "B25070_007E","B25070_008E","B25070_009E","B25070_010E","B25070_011E","B25070_001E",
     "B23025_002E","B23025_005E",
+    # Migration / Geographic Mobility (B07001)
+    "B07001_001E",  # Total pop 1yr+
+    "B07001_017E",  # Same house (non-movers)
+    "B07001_033E",  # Moved within same county
+    "B07001_049E",  # Moved from different county, same state
+    "B07001_065E",  # Moved from different state
+    "B07001_081E",  # Moved from abroad
+]
+
+# Migration variables for county-level (used in forecasting)
+MIGRATION_COUNTY_VARS = [
+    "B07001_001E","B07001_017E","B07001_033E","B07001_049E","B07001_065E","B07001_081E",
 ]
 
 # ── TOOLTIP DEFINITIONS ──
@@ -73,6 +85,10 @@ TT = {
     "treasury_10y": "**10-Year Treasury Yield** — Benchmark long-term rate. Cap rates, commercial loan pricing, and CMBS spreads all key off this. Source: Federal Reserve via FRED.",
     "yield_curve": "**Yield Curve Spread (10Y–2Y)** — Difference between 10-year and 2-year Treasury yields. Negative = inverted curve, historically a recession leading indicator. Source: FRED.",
     "rate_sensitivity": "**Rate Sensitivity Analysis** — Shows how ±100 basis point shifts in interest rates would affect forecast predictions, based on learned model coefficients.",
+    "migration": "**Migration / Geographic Mobility** — Measures population movement in and out of an area over the past year. Inflow rate = % of current residents who moved in from outside the county. Net inflow signals growing demand; net outflow signals declining demand. Source: Census ACS B07001.",
+    "inflow_rate": "**Inflow Rate** — % of population 1yr+ who moved into the area from a different county, state, or country in the past year. Higher = more new residents arriving.",
+    "turnover_rate": "**Turnover Rate** — % of population 1yr+ who moved at all (including within same county). High turnover can signal either a dynamic market or instability.",
+    "out_of_state": "**Out-of-State Inflow** — % of population who moved in from a different state. High values signal the area is attracting talent/residents from other regions.",
 }
 
 def tip(key):
@@ -185,6 +201,14 @@ def compute_tract_metrics(df):
     df["burden_pct"]=df[["B25070_008E","B25070_009E","B25070_010E","B25070_011E"]].sum(axis=1)/df["B25070_001E"].replace(0,np.nan)*100
     df["r2i"]=(df["B25064_001E"]*12)/df["B19013_001E"].replace(0,np.nan)*100
     df["unemp"]=df["B23025_005E"]/df["B23025_002E"].replace(0,np.nan)*100
+    # Migration metrics
+    mob_total = df["B07001_001E"].replace(0, np.nan)
+    if "B07001_033E" in df.columns:
+        df["moved_within"] = df["B07001_033E"] / mob_total * 100  # within county
+        df["inflow_rate"] = (df["B07001_049E"].fillna(0) + df["B07001_065E"].fillna(0) + df["B07001_081E"].fillna(0)) / mob_total * 100
+        df["out_of_state_in"] = df["B07001_065E"] / mob_total * 100
+        df["from_abroad"] = df["B07001_081E"] / mob_total * 100
+        df["turnover"] = (mob_total - df["B07001_017E"]) / mob_total * 100  # anyone who moved
     return df
 
 def compute_demand_score(df):
@@ -197,7 +221,45 @@ def compute_demand_score(df):
     return v
 
 # ── FORECASTING ENGINE ──
-def build_annual_dataset(fd):
+@st.cache_data(ttl=3600*24, show_spinner=False)
+def fetch_migration_timeseries(state="42", county="101", years=None):
+    """Fetch county-level ACS migration data across multiple years for forecasting."""
+    if not CENSUS_API_KEY: return pd.DataFrame()
+    if years is None:
+        years = list(range(2010, 2024))  # ACS 5-year available from ~2009 onward
+    rows = []
+    for yr in years:
+        try:
+            r = requests.get(f"https://api.census.gov/data/{yr}/acs/acs5",
+                params={"get": f"NAME,{','.join(MIGRATION_COUNTY_VARS)}",
+                        "for": f"county:{county}", "in": f"state:{state}",
+                        "key": CENSUS_API_KEY}, timeout=15)
+            if r.status_code == 200:
+                d = r.json()
+                if len(d) >= 2:
+                    row = dict(zip(d[0], d[1]))
+                    for v in MIGRATION_COUNTY_VARS:
+                        row[v] = float(row.get(v, 0)) if row.get(v) not in [None, "", "-666666666"] else np.nan
+                    total = row.get("B07001_001E", np.nan)
+                    if total and total > 0:
+                        same_house = row.get("B07001_017E", 0) or 0
+                        within_county = row.get("B07001_033E", 0) or 0
+                        diff_county = row.get("B07001_049E", 0) or 0
+                        diff_state = row.get("B07001_065E", 0) or 0
+                        abroad = row.get("B07001_081E", 0) or 0
+                        inflow = diff_county + diff_state + abroad
+                        rows.append({
+                            "year": yr,
+                            "inflow_rate": (inflow / total) * 100,
+                            "turnover_rate": ((total - same_house) / total) * 100,
+                            "out_of_state_rate": (diff_state / total) * 100,
+                            "within_county_rate": (within_county / total) * 100,
+                        })
+        except Exception:
+            continue
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+def build_annual_dataset(fd, migration_df=None):
     """Convert monthly FRED series into annual features for forecasting."""
     targets = {
         "Unemployment (%)": "unemp_philly",
@@ -217,6 +279,12 @@ def build_annual_dataset(fd):
         else:
             agg = tmp.groupby("year")["value"].last().rename(key)
         frames[key] = agg
+    # Add migration features
+    if migration_df is not None and not migration_df.empty:
+        mig = migration_df.set_index("year")
+        for col in ["inflow_rate", "turnover_rate", "out_of_state_rate"]:
+            if col in mig.columns:
+                frames[col] = mig[col]
     if not frames: return pd.DataFrame(), targets
     annual = pd.concat(frames.values(), axis=1).dropna(how="all")
     # Exclude current incomplete year to avoid partial-year bias
@@ -433,13 +501,31 @@ def compute_tract_opportunity(tracts_current, tracts_prior, macro_forecasts, hor
             macro_boost = np.mean(signals)
     scored["macro_n"] = macro_boost
 
-    # -- Composite Score --
-    scored["opp_pred"] = (
-        scored["fund_n"] * w_fund +
-        scored["momentum"] * w_mom +
-        scored["headroom_n"] * w_head +
-        scored["macro_n"] * w_macro
-    ) * 100
+    # -- Migration Signal (if available) --
+    has_migration = "inflow_rate" in scored.columns and scored["inflow_rate"].notna().sum() > 10
+    if has_migration:
+        inf_min, inf_max = scored["inflow_rate"].min(), scored["inflow_rate"].max()
+        scored["inflow_n"] = (scored["inflow_rate"] - inf_min) / (inf_max - inf_min + 0.01)
+        # Adjust weights to include migration
+        w_mig = 0.08
+        w_fund_adj = w_fund - 0.02
+        w_mom_adj = w_mom - 0.03
+        w_head_adj = w_head - 0.01
+        w_macro_adj = w_macro - 0.02
+        scored["opp_pred"] = (
+            scored["fund_n"] * w_fund_adj +
+            scored["momentum"] * w_mom_adj +
+            scored["headroom_n"] * w_head_adj +
+            scored["macro_n"] * w_macro_adj +
+            scored["inflow_n"] * w_mig
+        ) * 100
+    else:
+        scored["opp_pred"] = (
+            scored["fund_n"] * w_fund +
+            scored["momentum"] * w_mom +
+            scored["headroom_n"] * w_head +
+            scored["macro_n"] * w_macro
+        ) * 100
 
     return scored
 
@@ -724,6 +810,34 @@ with t_rent:
                     "% Renters":"{:.1f}%","Med Rent":"${:,.0f}","Med Income":"${:,.0f}","Rent/Inc %":"{:.1f}%"}),
                     use_container_width=True,hide_index=True)
 
+        # Migration / Mobility Section
+        st.markdown('<div class="section-label">Migration & Geographic Mobility</div>',unsafe_allow_html=True)
+        st.markdown(f'<div class="info-box">{tip("migration")}</div>',unsafe_allow_html=True)
+        if not tdf.empty and "inflow_rate" in tdf.columns:
+            tdf_mig = tdf.dropna(subset=["inflow_rate"]).copy()
+            if not tdf_mig.empty:
+                mm1,mm2,mm3,mm4=st.columns(4)
+                with mm1: st.metric("Avg Inflow Rate",f"{tdf_mig['inflow_rate'].mean():.1f}%",help=tip("inflow_rate"))
+                with mm2: st.metric("Avg Turnover",f"{tdf_mig['turnover'].mean():.1f}%",help=tip("turnover_rate"))
+                with mm3: st.metric("Avg Out-of-State In",f"{tdf_mig['out_of_state_in'].mean():.1f}%",help=tip("out_of_state"))
+                with mm4: st.metric("Avg From Abroad",f"{tdf_mig['from_abroad'].mean():.1f}%")
+                mr1,mr2=st.columns(2)
+                with mr1:
+                    top_inflow = tdf_mig.nlargest(15,"inflow_rate").copy()
+                    top_inflow["lbl"]=top_inflow["NAME"].str.replace(r"Census Tract (\d+\.?\d*),.*",r"Tract \1",regex=True)
+                    st.plotly_chart(bchart(top_inflow["lbl"].tolist(),top_inflow["inflow_rate"].tolist(),
+                        "Top 15 — Inflow Rate (%)",C["teal"],yl="Inflow %"),use_container_width=True)
+                with mr2:
+                    fig=go.Figure(go.Scatter(x=tdf_mig["inflow_rate"],y=tdf_mig["B25064_001E"],mode="markers",
+                        marker=dict(size=5,color=tdf_mig.get("score",tdf_mig["inflow_rate"]) if "score" in tdf_mig.columns else tdf_mig["inflow_rate"],
+                            opacity=0.7,colorscale=[[0,C["slate"]],[0.5,C["teal"]],[1,C["gold"]]],
+                            colorbar=dict(title="Score") if "score" in tdf_mig.columns else None),
+                        customdata=np.column_stack((tdf_mig["NAME"].values,tdf_mig["inflow_rate"].values)),
+                        hovertemplate="<b>%{customdata[0]}</b><br>Inflow: %{customdata[1]:.1f}%<br>Rent: $%{y:,.0f}<extra></extra>"))
+                    fig.update_layout(**BL,title=dict(text="Inflow Rate vs Median Rent",font=dict(size=16)),
+                        xaxis_title="Inflow Rate (%)",yaxis_title="Median Rent ($)",yaxis_tickprefix="$")
+                    st.plotly_chart(fig,use_container_width=True)
+
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 4: TRACT MAPS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -738,7 +852,8 @@ with t_maps:
         map_metric=st.selectbox("Metric",[
             "Young Adults (% Age 25–34)","Median Gross Rent ($)","Renter-Occupied (%)",
             "Median Household Income ($)","Rent Burden (30%+ Income)",
-            "Rent-to-Income Ratio (%)","Demand Score"])
+            "Rent-to-Income Ratio (%)","Demand Score",
+            "Inflow Rate (%)","Turnover Rate (%)","Out-of-State Inflow (%)"])
         if map_fips:
             geo=load_geojson("42")
             atract=fetch_multi_tracts(TRACT_VARS,map_fips)
@@ -752,7 +867,10 @@ with t_maps:
                     "Median Household Income ($)":("B19013_001E","Med Income","$",""),
                     "Rent Burden (30%+ Income)":("burden_pct","% Burdened","","%"),
                     "Rent-to-Income Ratio (%)":("r2i","Rent/Income","","%"),
-                    "Demand Score":("score","Score","","")}
+                    "Demand Score":("score","Score","",""),
+                    "Inflow Rate (%)":("inflow_rate","Inflow %","","%"),
+                    "Turnover Rate (%)":("turnover","Turnover %","","%"),
+                    "Out-of-State Inflow (%)":("out_of_state_in","Out-of-State %","","%")}
                 zcol,zlbl,zpre,zsuf=mmap[map_metric]
                 pdf=scored if zcol=="score" else atract
                 pdf=pdf.dropna(subset=[zcol])
@@ -893,7 +1011,13 @@ with t_fc:
             for k, sid in FRED_SERIES.items():
                 fd_full[k] = fetch_fred(sid, "2001-01-01")
 
-        annual, targets = build_annual_dataset(fd_full)
+        # Fetch county-level migration time series for forecast features
+        migration_ts = pd.DataFrame()
+        if CENSUS_API_KEY:
+            with st.spinner("Loading migration history…"):
+                migration_ts = fetch_migration_timeseries("42", "101", list(range(2010, 2024)))
+
+        annual, targets = build_annual_dataset(fd_full, migration_ts)
 
         if annual.empty:
             st.warning("Not enough data to build forecasts.")
@@ -1057,7 +1181,7 @@ with t_fc:
                 st.markdown("""
 **Model:** Ridge Regression with L2 regularization (α=1.0)
 
-**Features:** 1-year lagged values of all available FRED indicators (unemployment, permits, GDP, CPI shelter, CPI all items, construction employment, homeownership, median income)
+**Features:** 1-year lagged values of all available FRED indicators (unemployment, permits, GDP, CPI shelter, CPI all items, construction employment, homeownership, median income, fed funds rate, 10-year Treasury, 30-year mortgage, yield curve spread) plus Census ACS county-level migration features (inflow rate, turnover rate, out-of-state inflow rate)
 
 **Validation:** Expanding-window walk-forward backtest — the model is retrained at each step using only data available up to that point, then predicts the next year. This prevents data leakage and simulates real-world forecasting conditions.
 
@@ -1359,6 +1483,9 @@ with t_fc:
                             if "rent_growth" in top.columns:
                                 show_cols.extend(["rent_growth", "income_growth", "youth_growth"])
                                 extra_cols = {"rent_growth": "Rent Δ%", "income_growth": "Income Δ%", "youth_growth": "Youth Δpp"}
+                            if "inflow_rate" in top.columns:
+                                show_cols.extend(["inflow_rate", "turnover"])
+                                extra_cols.update({"inflow_rate": "Inflow %", "turnover": "Turnover %"})
                             rename.update(extra_cols)
                             tbl = top[[c for c in show_cols if c in top.columns]].rename(columns=rename)
                             fmt = {f"Opp Score ({opp_horizon_sel})": "{:.1f}", "Demand Score": "{:.0f}", "Rent": "${:,.0f}",
@@ -1369,6 +1496,8 @@ with t_fc:
                                     fmt[f"{h}yr Score"] = "{:.1f}"
                             if "Rent Δ%" in tbl.columns:
                                 fmt.update({"Rent Δ%": "{:+.1f}%", "Income Δ%": "{:+.1f}%", "Youth Δpp": "{:+.1f}pp"})
+                            if "Inflow %" in tbl.columns:
+                                fmt.update({"Inflow %": "{:.1f}%", "Turnover %": "{:.1f}%"})
                             st.dataframe(tbl.style.format({k: v for k, v in fmt.items() if k in tbl.columns}),
                                 use_container_width=True, hide_index=True)
 
@@ -1383,6 +1512,9 @@ with t_fc:
 | **Momentum** | 30% | Year-over-year improvement in rent, income, and young adult share (ACS 2022→2023) |
 | **Affordability Headroom** | 20% | Low rent-to-income ratio = room for rent increases without burdening tenants |
 | **Macro Alignment** | 10% | Whether FRED macro forecasts (GDP↑, unemployment↓, permits↑) are favorable |
+| **Migration Inflow** | 8%* | Higher inflow rate = more people moving in from outside the county (demand signal) |
+
+*When migration data is available, weights are redistributed: Fundamentals -2%, Momentum -3%, Headroom -1%, Macro -2%. When unavailable, the original 4-factor weighting is used.
 
 **Interpretation:**
 - **75+**: High-opportunity — strong fundamentals AND improving trajectory
