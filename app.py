@@ -1123,7 +1123,7 @@ with t_fc:
                 is_dollar = "$" in target_label
                 is_pct = "%" in target_label
                 def fv(v):
-                    if is_dollar and abs(v) >= 1e6: return f"${v/1e6:,.0f}M"
+                    if is_dollar and abs(v) >= 1e6: return f"${v/1e3:,.0f}B" if "GDP" in target_label else f"${v/1e6:,.0f}M"
                     if is_dollar and abs(v) >= 1e3: return f"${v/1e3:,.0f}K"
                     if is_dollar: return f"${v:,.0f}"
                     if is_pct: return f"{v:.1f}%"
@@ -1210,6 +1210,15 @@ with t_fc:
                     fmt = {}
                     if is_dollar: fmt["yaxis_tickprefix"] = "$"
                     if is_pct: fmt["yaxis_ticksuffix"] = "%"
+                    if "GDP" in target_label:
+                        # GDP values are in $M, format axis as billions
+                        fig.update_yaxes(tickformat=",", tickprefix="$", ticksuffix="")
+                        # Custom tick text showing B
+                        fig.update_layout(yaxis=dict(
+                            tickvals=[v for v in range(200000, 800001, 100000)],
+                            ticktext=[f"${v//1000}B" for v in range(200000, 800001, 100000)],
+                        ))
+                        fmt.pop("yaxis_tickprefix", None)
                     fig.update_layout(**BL, title=dict(text=f"{target_label} — History + Forecast", font=dict(size=14)), **fmt)
                     st.plotly_chart(fig, use_container_width=True)
 
