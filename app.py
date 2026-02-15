@@ -381,7 +381,7 @@ def fetch_irs_soi_migration():
 
     return inflow_df, outflow_df, pd.DataFrame()
 
-def build_annual_dataset(fd, migration_df=None, zillow_zori_metro=None):
+def build_annual_dataset(fd, migration_df=None, zillow_zori_metro=None, zhvi_fred=None):
     """Convert monthly FRED series into annual features for forecasting."""
     targets = {
         "Unemployment (%)": "unemp_philly",
@@ -413,6 +413,12 @@ def build_annual_dataset(fd, migration_df=None, zillow_zori_metro=None):
         zori["year"] = zori["date"].dt.year
         zori_annual = zori.groupby("year")["zori"].last().rename("zori_msa")
         frames["zori_msa"] = zori_annual
+    # Add ZHVI (Zillow Home Value Index) from FRED
+    if zhvi_fred is not None and not zhvi_fred.empty:
+        zhvi = zhvi_fred.copy()
+        zhvi["year"] = zhvi["date"].dt.year
+        zhvi_annual = zhvi.groupby("year")["value"].last().rename("zhvi_pa")
+        frames["zhvi_pa"] = zhvi_annual
     if not frames: return pd.DataFrame(), targets
     annual = pd.concat(frames.values(), axis=1).dropna(how="all")
     # Exclude current incomplete year to avoid partial-year bias
@@ -1339,7 +1345,9 @@ with t_fc:
         zori_fc = fetch_zori_csv()
         # Use ZHVI if available, ZORI as backup
         zillow_for_fc = zhvi_fred if not zhvi_fred.empty else None
-        annual, targets = build_annual_dataset(fd_full, migration_ts, zillow_zori_metro=zori_fc if not zori_fc.empty else None)
+        annual, targets = build_annual_dataset(fd_full, migration_ts,
+            zillow_zori_metro=zori_fc if not zori_fc.empty else None,
+            zhvi_fred=zhvi_fred if not zhvi_fred.empty else None)
 
         if annual.empty:
             st.warning("Not enough data to build forecasts.")
