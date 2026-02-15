@@ -1152,7 +1152,7 @@ with t_rent:
             fig_soi = go.Figure()
             if "N1_net" in net_soi.columns:
                 fig_soi.add_trace(go.Bar(x=net_soi["period"], y=net_soi["N1_net"],
-                    name="Net Households", marker_color=[C["teal"] if v >= 0 else C["warning"] for v in net_soi["N1_net"]]))
+                    name="Net Households", marker_color=[C["teal"] if v >= 0 else C["coral"] for v in net_soi["N1_net"]]))
             fig_soi.update_layout(**BL, title=dict(text="Philadelphia Net Migration (Households) — IRS SOI", font=dict(size=14)),
                 yaxis_title="Net Households", height=350)
             fig_soi.add_hline(y=0, line_dash="dash", line_color=C["slate"], opacity=0.5)
@@ -1162,7 +1162,7 @@ with t_rent:
             if "AGI_net" in net_soi.columns:
                 fig_agi = go.Figure()
                 fig_agi.add_trace(go.Bar(x=net_soi["period"], y=net_soi["AGI_net"] / 1000,
-                    name="Net AGI ($M)", marker_color=[C["gold"] if v >= 0 else C["warning"] for v in net_soi["AGI_net"]]))
+                    name="Net AGI ($M)", marker_color=[C["gold"] if v >= 0 else C["coral"] for v in net_soi["AGI_net"]]))
                 fig_agi.update_layout(**BL, title=dict(text="Philadelphia Net AGI Flow ($M) — IRS SOI", font=dict(size=14)),
                     yaxis_title="Net AGI ($M)", yaxis_tickprefix="$", height=350)
                 fig_agi.add_hline(y=0, line_dash="dash", line_color=C["slate"], opacity=0.5)
@@ -1175,7 +1175,7 @@ with t_rent:
                     fig_io.add_trace(go.Scatter(x=inflow_soi["period"], y=inflow_soi.get("N1", []),
                         mode="lines+markers", name="Inflow (Households)", line=dict(color=C["teal"], width=2)))
                     fig_io.add_trace(go.Scatter(x=outflow_soi["period"], y=outflow_soi.get("N1", []),
-                        mode="lines+markers", name="Outflow (Households)", line=dict(color=C["warning"], width=2)))
+                        mode="lines+markers", name="Outflow (Households)", line=dict(color=C["coral"], width=2)))
                     fig_io.update_layout(**BL, title=dict(text="Household Inflow vs Outflow", font=dict(size=14)),
                         yaxis_title="Households (Tax Returns)", height=350)
                     st.plotly_chart(fig_io, use_container_width=True)
