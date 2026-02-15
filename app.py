@@ -259,9 +259,163 @@ def fetch_migration_timeseries(state="42", county="101", years=None):
             continue
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
-# County-level FRED series patterns (unemployment rate, median income, homeownership)
-# Permits, GDP, CPI, construction employment, and interest rates are MSA/national level (shared across counties)
-def build_annual_dataset(fd, migration_df=None):
+# ── ZILLOW RENT & HOME VALUE DATA ──
+ZILLOW_ZORI_ZIP = "https://files.zillowstatic.com/research/public_csvs/zori/Zip_zori_sm_month.csv"
+ZILLOW_ZHVI_ZIP = "https://files.zillowstatic.com/research/public_csvs/zhvi/Zip_zhvi_uc_sfrcondo_tier_0.33_0.67_sm_sa_month.csv"
+ZILLOW_ZORI_METRO = "https://files.zillowstatic.com/research/public_csvs/zori/Metro_zori_sm_month.csv"
+ZILLOW_ZHVI_METRO = "https://files.zillowstatic.com/research/public_csvs/zhvi/Metro_zhvi_uc_sfrcondo_tier_0.33_0.67_sm_sa_month.csv"
+
+# Philadelphia-area zip codes (Philadelphia County + nearby)
+PHILLY_ZIPS = [str(z) for z in range(19100, 19200)]  # Philadelphia 191xx zips
+
+@st.cache_data(ttl=3600*24, show_spinner=False)
+def fetch_zillow_zori_zips():
+    """Fetch Zillow ZORI (observed rent index) at zip code level for Philadelphia area."""
+    try:
+        df = pd.read_csv(ZILLOW_ZORI_ZIP)
+        # Filter to Philadelphia-area zips
+        df["RegionName"] = df["RegionName"].astype(str).str.zfill(5)
+        philly = df[df["RegionName"].str.startswith("191")]
+        if philly.empty: return pd.DataFrame(), pd.DataFrame()
+        # Melt from wide to long
+        date_cols = [c for c in philly.columns if c[:4].isdigit()]
+        meta_cols = ["RegionName", "City", "State", "CountyName"]
+        meta_cols = [c for c in meta_cols if c in philly.columns]
+        long = philly.melt(id_vars=meta_cols, value_vars=date_cols, var_name="date", value_name="zori")
+        long["date"] = pd.to_datetime(long["date"])
+        long = long.dropna(subset=["zori"])
+        # Also compute metro-level summary
+        summary = long.groupby("date")["zori"].agg(["mean", "median", "min", "max"]).reset_index()
+        summary.columns = ["date", "zori_mean", "zori_median", "zori_min", "zori_max"]
+        return long, summary
+    except Exception:
+        return pd.DataFrame(), pd.DataFrame()
+
+@st.cache_data(ttl=3600*24, show_spinner=False)
+def fetch_zillow_zhvi_zips():
+    """Fetch Zillow ZHVI (home value index) at zip code level for Philadelphia area."""
+    try:
+        df = pd.read_csv(ZILLOW_ZHVI_ZIP)
+        df["RegionName"] = df["RegionName"].astype(str).str.zfill(5)
+        philly = df[df["RegionName"].str.startswith("191")]
+        if philly.empty: return pd.DataFrame(), pd.DataFrame()
+        date_cols = [c for c in philly.columns if c[:4].isdigit()]
+        meta_cols = ["RegionName", "City", "State", "CountyName"]
+        meta_cols = [c for c in meta_cols if c in philly.columns]
+        long = philly.melt(id_vars=meta_cols, value_vars=date_cols, var_name="date", value_name="zhvi")
+        long["date"] = pd.to_datetime(long["date"])
+        long = long.dropna(subset=["zhvi"])
+        summary = long.groupby("date")["zhvi"].agg(["mean", "median", "min", "max"]).reset_index()
+        summary.columns = ["date", "zhvi_mean", "zhvi_median", "zhvi_min", "zhvi_max"]
+        return long, summary
+    except Exception:
+        return pd.DataFrame(), pd.DataFrame()
+
+@st.cache_data(ttl=3600*24, show_spinner=False)
+def fetch_zillow_metro():
+    """Fetch metro-level ZORI and ZHVI for Philadelphia MSA."""
+    try:
+        zori = pd.read_csv(ZILLOW_ZORI_METRO)
+        zhvi = pd.read_csv(ZILLOW_ZHVI_METRO)
+        # Filter to Philadelphia MSA
+        zori_philly = zori[zori["RegionName"].str.contains("Philadelphia", case=False, na=False)]
+        zhvi_philly = zhvi[zhvi["RegionName"].str.contains("Philadelphia", case=False, na=False)]
+
+        results = {}
+        for label, df_filt, val_col in [("zori", zori_philly, "zori"), ("zhvi", zhvi_philly, "zhvi")]:
+            if df_filt.empty: continue
+            date_cols = [c for c in df_filt.columns if c[:4].isdigit()]
+            row = df_filt.iloc[0]
+            ts = pd.DataFrame({"date": pd.to_datetime(date_cols), val_col: [row[c] for c in date_cols]})
+            ts = ts.dropna()
+            results[label] = ts
+        return results.get("zori", pd.DataFrame()), results.get("zhvi", pd.DataFrame())
+    except Exception:
+        return pd.DataFrame(), pd.DataFrame()
+
+# ── IRS SOI COUNTY-TO-COUNTY MIGRATION ──
+@st.cache_data(ttl=3600*24, show_spinner=False)
+def fetch_irs_soi_migration():
+    """Fetch IRS SOI county-to-county migration data for Philadelphia.
+    Returns inflow and outflow DataFrames with returns, exemptions, and AGI."""
+    base_url = "https://www.irs.gov/pub/irs-soi"
+    # IRS publishes county-to-county inflow/outflow CSVs per year pair
+    # Format: countyinflow{yy1}{yy2}.csv / countyoutflow{yy1}{yy2}.csv
+    # Philadelphia County FIPS: 42101
+    years = []
+    for y1 in range(2011, 2022):  # 2011-12 through 2021-22
+        y2 = y1 + 1
+        yy1, yy2 = str(y1)[2:], str(y2)[2:]
+        years.append((y1, y2, yy1, yy2))
+
+    inflow_records = []
+    outflow_records = []
+    for y1, y2, yy1, yy2 in years:
+        for direction, records in [("inflow", inflow_records), ("outflow", outflow_records)]:
+            try:
+                url = f"{base_url}/county{direction}{yy1}{yy2}.csv"
+                df = pd.read_csv(url, encoding="latin-1", dtype=str)
+                # Normalize column names (they vary across years)
+                df.columns = [c.strip().upper() for c in df.columns]
+                # Rename common variations
+                col_map = {}
+                for c in df.columns:
+                    if "Y1_STATEFIPS" in c or c == "Y1_STATEFIPS": col_map[c] = "Y1_STATEFIPS"
+                    elif "Y2_STATEFIPS" in c or c == "Y2_STATEFIPS": col_map[c] = "Y2_STATEFIPS"
+                    elif "Y1_COUNTYFIPS" in c or c == "Y1_COUNTYFIPS": col_map[c] = "Y1_COUNTYFIPS"
+                    elif "Y2_COUNTYFIPS" in c or c == "Y2_COUNTYFIPS": col_map[c] = "Y2_COUNTYFIPS"
+                    elif c in ("N1", "RETURN"): col_map[c] = "N1"
+                    elif c in ("N2", "EXEMPTION"): col_map[c] = "N2"
+                    elif c in ("AGI", "AGI_ADJ"): col_map[c] = "AGI"
+                df = df.rename(columns=col_map)
+
+                if direction == "inflow":
+                    # Filter: destination is Philadelphia (Y2 = 42, 101)
+                    mask = (df.get("Y2_STATEFIPS", pd.Series(dtype=str)).str.strip() == "42") & \
+                           (df.get("Y2_COUNTYFIPS", pd.Series(dtype=str)).str.strip() == "101")
+                else:
+                    # Filter: origin is Philadelphia (Y1 = 42, 101)
+                    mask = (df.get("Y1_STATEFIPS", pd.Series(dtype=str)).str.strip() == "42") & \
+                           (df.get("Y1_COUNTYFIPS", pd.Series(dtype=str)).str.strip() == "101")
+
+                filtered = df[mask].copy()
+                if filtered.empty: continue
+
+                # Aggregate: total returns, exemptions, AGI flowing in/out
+                for col in ["N1", "N2", "AGI"]:
+                    if col in filtered.columns:
+                        filtered[col] = pd.to_numeric(filtered[col].str.replace(",", ""), errors="coerce")
+
+                # Exclude "same state non-migrants" and totals rows (county=000 or 999)
+                county_col = "Y1_COUNTYFIPS" if direction == "inflow" else "Y2_COUNTYFIPS"
+                if county_col in filtered.columns:
+                    filtered = filtered[~filtered[county_col].str.strip().isin(["000", "999", "-1"])]
+
+                agg = {}
+                for col in ["N1", "N2", "AGI"]:
+                    if col in filtered.columns:
+                        agg[col] = filtered[col].sum()
+                agg["year"] = y2  # Filing year (when people filed, reflecting prior year move)
+                agg["period"] = f"{y1}-{y2}"
+                records.append(agg)
+            except Exception:
+                continue
+
+    inflow_df = pd.DataFrame(inflow_records) if inflow_records else pd.DataFrame()
+    outflow_df = pd.DataFrame(outflow_records) if outflow_records else pd.DataFrame()
+
+    # Compute net migration
+    if not inflow_df.empty and not outflow_df.empty:
+        merged = inflow_df.merge(outflow_df, on=["year", "period"], suffixes=("_in", "_out"))
+        for col in ["N1", "N2", "AGI"]:
+            in_col, out_col = f"{col}_in", f"{col}_out"
+            if in_col in merged.columns and out_col in merged.columns:
+                merged[f"{col}_net"] = merged[in_col] - merged[out_col]
+        return inflow_df, outflow_df, merged
+
+    return inflow_df, outflow_df, pd.DataFrame()
+
+def build_annual_dataset(fd, migration_df=None, zillow_zori_metro=None):
     """Convert monthly FRED series into annual features for forecasting."""
     targets = {
         "Unemployment (%)": "unemp_philly",
@@ -287,6 +441,12 @@ def build_annual_dataset(fd, migration_df=None):
         for col in ["inflow_rate", "turnover_rate", "out_of_state_rate"]:
             if col in mig.columns:
                 frames[col] = mig[col]
+    # Add Zillow ZORI as monthly-to-annual feature
+    if zillow_zori_metro is not None and not zillow_zori_metro.empty:
+        zori = zillow_zori_metro.copy()
+        zori["year"] = zori["date"].dt.year
+        zori_annual = zori.groupby("year")["zori"].last().rename("zori_msa")
+        frames["zori_msa"] = zori_annual
     if not frames: return pd.DataFrame(), targets
     annual = pd.concat(frames.values(), axis=1).dropna(how="all")
     # Exclude current incomplete year to avoid partial-year bias
@@ -652,6 +812,7 @@ with st.sidebar:
         ci=st.text_input("Census API Key",type="password",help="Free at https://api.census.gov/data/key_signup.html")
         if ci: CENSUS_API_KEY=ci; os.environ["CENSUS_API_KEY"]=ci; st.rerun()
     else: st.success("✓ Census API connected")
+    st.caption("+ Zillow ZORI/ZHVI · IRS SOI Migration")
     st.divider()
     st.markdown('<div class="section-label">Time Range</div>', unsafe_allow_html=True)
     start_year=st.slider("Start year",2010,2024,2015)
@@ -923,6 +1084,104 @@ with t_rent:
                         xaxis_title="Inflow Rate (%)",yaxis_title="Median Rent ($)",yaxis_tickprefix="$")
                     st.plotly_chart(fig,use_container_width=True)
 
+        # ── ZILLOW REAL-TIME RENT & HOME VALUES ──
+        st.markdown('<div class="section-label">Zillow Real-Time Rent & Home Value Indices</div>',unsafe_allow_html=True)
+        st.markdown('<div class="info-box">Monthly rent (ZORI) and home value (ZHVI) indices for Philadelphia-area zip codes. Updated monthly by Zillow Research. Fills the gap between annual ACS releases with real-time market signals.</div>',unsafe_allow_html=True)
+
+        zori_metro, zhvi_metro = fetch_zillow_metro()
+        zori_zips, zori_summary = fetch_zillow_zori_zips()
+        zhvi_zips, zhvi_summary = fetch_zillow_zhvi_zips()
+
+        if not zori_metro.empty or not zhvi_metro.empty:
+            zc1, zc2 = st.columns(2)
+            with zc1:
+                if not zori_metro.empty:
+                    latest_rent = zori_metro["zori"].iloc[-1]
+                    yoy_rent = ((zori_metro["zori"].iloc[-1] / zori_metro["zori"].iloc[-13]) - 1) * 100 if len(zori_metro) > 13 else 0
+                    st.metric("MSA Median Rent (ZORI)", f"${latest_rent:,.0f}/mo", f"{yoy_rent:+.1f}% YoY")
+                    fig_zori = go.Figure(go.Scatter(x=zori_metro["date"], y=zori_metro["zori"], mode="lines",
+                        line=dict(color=C["teal"], width=2)))
+                    fig_zori.update_layout(**BL, title=dict(text="Philadelphia MSA — ZORI (Monthly Rent Index)", font=dict(size=14)),
+                        yaxis_tickprefix="$", height=300)
+                    st.plotly_chart(fig_zori, use_container_width=True)
+            with zc2:
+                if not zhvi_metro.empty:
+                    latest_val = zhvi_metro["zhvi"].iloc[-1]
+                    yoy_val = ((zhvi_metro["zhvi"].iloc[-1] / zhvi_metro["zhvi"].iloc[-13]) - 1) * 100 if len(zhvi_metro) > 13 else 0
+                    st.metric("MSA Median Home Value (ZHVI)", f"${latest_val:,.0f}", f"{yoy_val:+.1f}% YoY")
+                    fig_zhvi = go.Figure(go.Scatter(x=zhvi_metro["date"], y=zhvi_metro["zhvi"], mode="lines",
+                        line=dict(color=C["gold"], width=2)))
+                    fig_zhvi.update_layout(**BL, title=dict(text="Philadelphia MSA — ZHVI (Home Value Index)", font=dict(size=14)),
+                        yaxis_tickprefix="$", height=300)
+                    st.plotly_chart(fig_zhvi, use_container_width=True)
+
+            # Zip-code breakdown
+            if not zori_zips.empty:
+                with st.expander("📍 Rent by Zip Code (ZORI)"):
+                    latest_date = zori_zips["date"].max()
+                    latest_zips = zori_zips[zori_zips["date"] == latest_date].sort_values("zori", ascending=False)
+                    fig_zip = bchart(latest_zips["RegionName"].head(20).tolist(), latest_zips["zori"].head(20).tolist(),
+                        "Current ZORI by Zip Code (Top 20)", C["teal"], horiz=True, yl="$/month", yp="$")
+                    st.plotly_chart(fig_zip, use_container_width=True)
+        else:
+            st.caption("Zillow data unavailable — may be a connectivity issue. Data loads from files.zillowstatic.com.")
+
+        # ── IRS SOI INCOME-STRATIFIED MIGRATION ──
+        st.markdown('<div class="section-label">IRS SOI — Income-Stratified Migration</div>',unsafe_allow_html=True)
+        st.markdown('<div class="info-box">County-to-county migration flows from IRS tax returns. Shows not just <i>how many</i> people move in/out, but their <b>adjusted gross income (AGI)</b>. A county gaining high-AGI households has different investment implications than one gaining low-AGI households. Source: IRS Statistics of Income, county-to-county migration files.</div>',unsafe_allow_html=True)
+
+        inflow_soi, outflow_soi, net_soi = fetch_irs_soi_migration()
+
+        if not net_soi.empty:
+            sc1, sc2, sc3 = st.columns(3)
+            latest_net = net_soi.iloc[-1]
+            with sc1:
+                n1_net = latest_net.get("N1_net", 0)
+                st.metric("Net Households (Returns)", f"{n1_net:+,.0f}",
+                    help="Positive = more households moved TO Philadelphia than left. Based on tax return address changes.")
+            with sc2:
+                n2_net = latest_net.get("N2_net", 0)
+                st.metric("Net Individuals (Exemptions)", f"{n2_net:+,.0f}")
+            with sc3:
+                agi_net = latest_net.get("AGI_net", 0)
+                # AGI is in thousands of dollars
+                st.metric("Net AGI", f"${agi_net/1000:+,.0f}M" if abs(agi_net) >= 1000 else f"${agi_net:+,.0f}K",
+                    help="Net adjusted gross income flowing in vs. out. Positive = Philadelphia gaining taxable income.")
+
+            # Time series chart
+            fig_soi = go.Figure()
+            if "N1_net" in net_soi.columns:
+                fig_soi.add_trace(go.Bar(x=net_soi["period"], y=net_soi["N1_net"],
+                    name="Net Households", marker_color=[C["teal"] if v >= 0 else C["warning"] for v in net_soi["N1_net"]]))
+            fig_soi.update_layout(**BL, title=dict(text="Philadelphia Net Migration (Households) — IRS SOI", font=dict(size=14)),
+                yaxis_title="Net Households", height=350)
+            fig_soi.add_hline(y=0, line_dash="dash", line_color=C["slate"], opacity=0.5)
+            st.plotly_chart(fig_soi, use_container_width=True)
+
+            # AGI net flow chart
+            if "AGI_net" in net_soi.columns:
+                fig_agi = go.Figure()
+                fig_agi.add_trace(go.Bar(x=net_soi["period"], y=net_soi["AGI_net"] / 1000,
+                    name="Net AGI ($M)", marker_color=[C["gold"] if v >= 0 else C["warning"] for v in net_soi["AGI_net"]]))
+                fig_agi.update_layout(**BL, title=dict(text="Philadelphia Net AGI Flow ($M) — IRS SOI", font=dict(size=14)),
+                    yaxis_title="Net AGI ($M)", yaxis_tickprefix="$", height=350)
+                fig_agi.add_hline(y=0, line_dash="dash", line_color=C["slate"], opacity=0.5)
+                st.plotly_chart(fig_agi, use_container_width=True)
+
+            # Inflow vs outflow detail
+            with st.expander("📊 Inflow vs Outflow Detail"):
+                if not inflow_soi.empty and not outflow_soi.empty:
+                    fig_io = go.Figure()
+                    fig_io.add_trace(go.Scatter(x=inflow_soi["period"], y=inflow_soi.get("N1", []),
+                        mode="lines+markers", name="Inflow (Households)", line=dict(color=C["teal"], width=2)))
+                    fig_io.add_trace(go.Scatter(x=outflow_soi["period"], y=outflow_soi.get("N1", []),
+                        mode="lines+markers", name="Outflow (Households)", line=dict(color=C["warning"], width=2)))
+                    fig_io.update_layout(**BL, title=dict(text="Household Inflow vs Outflow", font=dict(size=14)),
+                        yaxis_title="Households (Tax Returns)", height=350)
+                    st.plotly_chart(fig_io, use_container_width=True)
+        else:
+            st.caption("IRS SOI data unavailable — may be a connectivity issue. Data loads from irs.gov.")
+
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 4: TRACT MAPS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1102,7 +1361,9 @@ with t_fc:
             with st.spinner("Loading migration history…"):
                 migration_ts = fetch_migration_timeseries("42", "101", list(range(2010, 2024)))
 
-        annual, targets = build_annual_dataset(fd_full, migration_ts)
+        # Fetch Zillow metro data for forecast features
+        zori_metro_fc, _ = fetch_zillow_metro()
+        annual, targets = build_annual_dataset(fd_full, migration_ts, zillow_zori_metro=zori_metro_fc)
 
         if annual.empty:
             st.warning("Not enough data to build forecasts.")
