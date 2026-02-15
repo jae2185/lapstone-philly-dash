@@ -261,274 +261,6 @@ def fetch_migration_timeseries(state="42", county="101", years=None):
 
 # County-level FRED series patterns (unemployment rate, median income, homeownership)
 # Permits, GDP, CPI, construction employment, and interest rates are MSA/national level (shared across counties)
-COUNTY_FRED = {
-    "Philadelphia":   {"unemp": "PAPHIL5URN", "med_income": "MHIPA42101A052NCEN", "homeown": "HOWNRATEACS042101"},
-    "Montgomery":     {"unemp": "PAMONT5URN", "med_income": "MHIPA42091A052NCEN", "homeown": "HOWNRATEACS042091"},
-    "Bucks":          {"unemp": "PABUCK5URN", "med_income": "MHIPA42017A052NCEN", "homeown": "HOWNRATEACS042017"},
-    "Delaware":       {"unemp": "PADELA5URN", "med_income": "MHIPA42045A052NCEN", "homeown": "HOWNRATEACS042045"},
-    "Chester":        {"unemp": "PACHES5URN", "med_income": "MHIPA42029A052NCEN", "homeown": "HOWNRATEACS042029"},
-    "Berks (Reading)":{"unemp": "PABERK5URN", "med_income": "MHIPA42011A052NCEN", "homeown": "HOWNRATEACS042011"},
-    "Camden (NJ)":    {"unemp": "NJCAMD5URN", "med_income": "MHIPA34007A052NCEN", "homeown": "HOWNRATEACS034007"},
-    "Burlington (NJ)":{"unemp": "NJBURL5URN", "med_income": "MHIPA34005A052NCEN", "homeown": "HOWNRATEACS034005"},
-    "Gloucester (NJ)":{"unemp": "NJGLOU5URN", "med_income": "MHIPA34015A052NCEN", "homeown": "HOWNRATEACS034015"},
-}
-
-@st.cache_data(ttl=3600*24, show_spinner=False)
-def build_panel_dataset(fd_shared, migration_df=None):
-    """Build a stacked panel dataset across all 9 counties for panel regression.
-    County-varying: unemployment, median income, homeownership, migration.
-    Shared (MSA/national): permits, GDP, CPI, construction emp, interest rates.
-    Returns: panel DataFrame with 'county' column and county dummies."""
-
-    # Shared features (MSA/national level) — same for all counties
-    shared_keys = ["permits_tot", "gdp", "cpi_shelter", "cpi_all", "const_emp",
-                   "fed_funds", "treasury_10y", "mortgage_30y", "spread_10y2y"]
-    shared_frames = {}
-    for key in shared_keys:
-        df = fd_shared.get(key, pd.DataFrame())
-        if df.empty: continue
-        tmp = df.copy(); tmp["year"] = tmp["date"].dt.year
-        if key == "permits_tot":
-            agg = tmp.groupby("year")["value"].sum().rename(key)
-        else:
-            agg = tmp.groupby("year")["value"].last().rename(key)
-        shared_frames[key] = agg
-
-    if not shared_frames:
-        return pd.DataFrame()
-
-    shared = pd.concat(shared_frames.values(), axis=1).dropna(how="all")
-    current_year = datetime.now().year
-    shared = shared[shared.index < current_year]
-
-    # County-varying features
-    all_panels = []
-    for county_name, series_map in COUNTY_FRED.items():
-        county_frames = {}
-        for feat, sid in series_map.items():
-            df = fetch_fred(sid, "2001-01-01")
-            if df.empty: continue
-            tmp = df.copy(); tmp["year"] = tmp["date"].dt.year
-            agg = tmp.groupby("year")["value"].last().rename(feat)
-            county_frames[feat] = agg
-
-        if not county_frames: continue
-        county_df = pd.concat(county_frames.values(), axis=1).dropna(how="all")
-
-        # Add migration for this county if available
-        if migration_df is not None and not migration_df.empty and county_name == "Philadelphia":
-            mig = migration_df.set_index("year")
-            for col in ["inflow_rate", "turnover_rate", "out_of_state_rate"]:
-                if col in mig.columns:
-                    county_df[col] = mig[col]
-        # For non-Philadelphia counties, fetch migration if possible
-        elif county_name != "Philadelphia":
-            state_fips, county_fips = COUNTY_FIPS[county_name]
-            mig_county = fetch_migration_timeseries(state_fips, county_fips, list(range(2010, 2024)))
-            if not mig_county.empty:
-                mig_c = mig_county.set_index("year")
-                for col in ["inflow_rate", "turnover_rate", "out_of_state_rate"]:
-                    if col in mig_c.columns:
-                        county_df[col] = mig_c[col]
-
-        # Merge with shared data
-        merged = shared.join(county_df, how="inner")
-        merged["county"] = county_name
-        all_panels.append(merged)
-
-    if not all_panels:
-        return pd.DataFrame()
-
-    panel = pd.concat(all_panels)
-    panel.index.name = "year"
-    return panel
-
-def run_panel_forecast(panel, target_col, predict_county="Philadelphia", n_backtest=5, horizons=(1, 2, 5)):
-    """Panel Ridge regression with county fixed effects. Returns same format as _run_single_forecast."""
-    from sklearn.linear_model import Ridge
-    from sklearn.preprocessing import StandardScaler
-
-    if panel.empty or target_col not in panel.columns:
-        return None
-
-    # Add county dummies (fixed effects)
-    panel_fe = panel.copy()
-    counties = panel_fe["county"].unique()
-    if len(counties) < 2:
-        return None  # Need multiple counties for panel to add value
-
-    for c in counties:
-        panel_fe[f"fe_{c}"] = (panel_fe["county"] == c).astype(int)
-    panel_fe = panel_fe.drop(columns=["county"])
-
-    # Forward fill and clean
-    panel_fe = panel_fe.ffill().bfill()
-    feature_cols = [c for c in panel_fe.columns if c != target_col]
-
-    # Build lagged features per county group — need to lag within each county
-    # Re-sort by county then year
-    panel_fe = panel_fe.reset_index()
-    # Since we dropped 'county' but have fe_ columns, recover county from dummies
-    county_col = None
-    for c in counties:
-        mask = panel_fe[f"fe_{c}"] == 1
-        panel_fe.loc[mask, "_county"] = c
-    panel_fe = panel_fe.sort_values(["_county", "year"])
-
-    # Lag within each county
-    lagged_parts = []
-    for c in counties:
-        cdata = panel_fe[panel_fe["_county"] == c].copy()
-        cdata = cdata.set_index("year")
-        lag = cdata[feature_cols].shift(1)
-        lag.columns = [f"{col}_lag1" for col in feature_cols]
-        combo = pd.concat([cdata[[target_col, "_county"]], lag], axis=1).iloc[1:]
-        lagged_parts.append(combo)
-
-    combo = pd.concat(lagged_parts).replace([np.inf, -np.inf], np.nan).dropna()
-    if len(combo) < 15:
-        return None
-
-    X = combo.drop(columns=[target_col, "_county"])
-    y = combo[target_col]
-    county_labels = combo["_county"]
-    feat_names = X.columns.tolist()
-
-    # Filter to target county for backtest evaluation
-    target_mask = county_labels == predict_county
-    if target_mask.sum() < 5:
-        return None
-
-    # Walk-forward backtest on target county, training on all counties
-    max_h = max(horizons)
-    bt_all = []
-    target_indices = np.where(target_mask.values)[0]
-    min_split = max(len(X) - len(target_indices), target_indices[0] + 3)
-
-    for ti in range(max(0, len(target_indices) - n_backtest - max_h), len(target_indices) - 1):
-        split_idx = target_indices[ti]
-        # Train on everything up to this point (all counties)
-        train_mask = np.arange(len(X)) <= split_idx
-        X_tr, y_tr = X.iloc[train_mask], y.iloc[train_mask]
-        if len(X_tr) < 10: continue
-
-        sc_bt = StandardScaler(); X_tr_s = sc_bt.fit_transform(X_tr)
-        m_bt = Ridge(alpha=1.0); m_bt.fit(X_tr_s, y_tr)
-
-        # Get the target county row at split point for iterative prediction
-        county_data = panel_fe[panel_fe["_county"] == predict_county].set_index("year")
-        split_year = combo.index[split_idx]
-        if split_year not in county_data.index: continue
-        sim_row = county_data[feature_cols].loc[[split_year]].copy()
-
-        for h in range(1, max_h + 1):
-            # Find next target county index
-            if ti + h >= len(target_indices): break
-            future_idx = target_indices[ti + h]
-            if future_idx >= len(y): break
-
-            inp = sim_row.copy()
-            inp.columns = [f"{col}_lag1" for col in feature_cols]
-            inp = inp[[f for f in feat_names if f in inp.columns]]
-            for f in feat_names:
-                if f not in inp.columns:
-                    inp[f] = 0
-            inp = inp[feat_names]
-
-            pred_h = m_bt.predict(sc_bt.transform(inp))[0]
-            actual_h = y.iloc[future_idx]
-            bt_all.append({
-                "year_origin": combo.index[split_idx],
-                "year_target": combo.index[future_idx],
-                "horizon": h, "predicted": pred_h, "actual": actual_h,
-            })
-            sim_row = sim_row.copy()
-            if target_col in sim_row.columns:
-                sim_row[target_col] = pred_h
-
-    bt_full = pd.DataFrame(bt_all)
-    if bt_full.empty: return None
-    bt_full["error"] = bt_full["predicted"] - bt_full["actual"]
-    bt_full["abs_pct_error"] = (bt_full["error"].abs() / bt_full["actual"].abs().clip(lower=0.01)) * 100
-
-    horizon_accuracy = {}
-    for h in horizons:
-        bh = bt_full[bt_full["horizon"] == h]
-        if not bh.empty:
-            horizon_accuracy[h] = {
-                "mape": bh["abs_pct_error"].mean(),
-                "rmse": np.sqrt((bh["error"] ** 2).mean()),
-                "n": len(bh),
-            }
-
-    bt1 = bt_full[bt_full["horizon"] == 1].copy().rename(columns={"year_target": "year"})
-    mape = bt1["abs_pct_error"].mean() if not bt1.empty else 0
-    rmse = np.sqrt((bt1["error"] ** 2).mean()) if not bt1.empty else 0
-    std_err = bt1["error"].std() if len(bt1) > 1 else abs(y[target_mask].iloc[-1]) * 0.05
-
-    # Train final model on all data
-    sc = StandardScaler(); X_s = sc.fit_transform(X); m = Ridge(alpha=1.0); m.fit(X_s, y)
-    coefs = pd.Series(m.coef_, index=feat_names).abs().sort_values(ascending=False)
-    # Filter out fixed effect coefficients for display
-    coefs_display = coefs[[c for c in coefs.index if not c.startswith("fe_")]]
-
-    # Forecast for target county
-    county_data = panel_fe[panel_fe["_county"] == predict_county].set_index("year")
-    last_known = county_data[feature_cols].iloc[-1:].copy()
-    base_year = int(county_data.index[-1])
-    forecasts = []
-    simulated_row = last_known.copy()
-    for h in range(1, max_h + 1):
-        inp = simulated_row.copy()
-        inp.columns = [f"{col}_lag1" for col in feature_cols]
-        inp = inp[[f for f in feat_names if f in inp.columns]]
-        for f in feat_names:
-            if f not in inp.columns:
-                inp[f] = 0
-        inp = inp[feat_names]
-        pred = m.predict(sc.transform(inp))[0]
-        h_err = std_err
-        if h in horizon_accuracy and horizon_accuracy[h]["n"] > 1:
-            bh = bt_full[bt_full["horizon"] == h]
-            h_err = bh["error"].std()
-        forecasts.append({
-            "year": base_year + h, "value": pred,
-            "ci_low": pred - 1.96 * h_err, "ci_high": pred + 1.96 * h_err,
-            "horizon": h,
-        })
-        simulated_row = simulated_row.copy()
-        if target_col in simulated_row.columns:
-            simulated_row[target_col] = pred
-
-    fc_df = pd.DataFrame(forecasts)
-    horizon_results = {}
-    for h in horizons:
-        row = fc_df[fc_df["horizon"] == h]
-        if not row.empty:
-            r = row.iloc[0]
-            horizon_results[h] = {
-                "year": int(r["year"]), "value": r["value"],
-                "ci_low": r["ci_low"], "ci_high": r["ci_high"],
-            }
-
-    weighted_mape = 0; total_w = 0
-    for h, w in [(1, 3), (2, 2), (5, 1)]:
-        if h in horizon_accuracy:
-            weighted_mape += horizon_accuracy[h]["mape"] * w
-            total_w += w
-    weighted_mape = weighted_mape / total_w if total_w > 0 else mape
-
-    return {
-        "backtest": bt1, "backtest_full": bt_full,
-        "horizon_accuracy": horizon_accuracy,
-        "mape": mape, "rmse": rmse, "weighted_mape": weighted_mape,
-        "forecasts": fc_df, "horizon_results": horizon_results,
-        "last_actual_year": base_year, "last_actual_val": y[target_mask].iloc[-1],
-        "importance": coefs_display, "n_train": len(combo), "std_err": std_err,
-        "detrended": False, "trend_coef": 0, "trend_intercept": 0,
-        "n_counties": len(counties), "panel_obs": len(combo),
-    }
-
 def build_annual_dataset(fd, migration_df=None):
     """Convert monthly FRED series into annual features for forecasting."""
     targets = {
@@ -708,85 +440,10 @@ def _run_single_forecast(clean, target_col, feature_cols, n_backtest=5, horizons
         "trend_coef": trend_coef, "trend_intercept": trend_intercept,
     }
 
-def run_forecast(annual, target_col, n_backtest=5, horizons=(1, 2, 5), panel_data=None):
-    """Run standard, trend-adjusted, panel, and BSTS forecasts. Auto-select the best by backtest."""
+def run_forecast(annual, target_col, n_backtest=5, horizons=(1, 2, 5)):
+    """Run standard and trend-adjusted forecasts, auto-select the better model by backtest."""
     from sklearn.linear_model import Ridge
     from sklearn.preprocessing import StandardScaler
-
-    # ── BSTS via statsmodels UnobservedComponents ──
-    result_bsts = None
-    try:
-        from statsmodels.tsa.statespace.structural import UnobservedComponents
-        y_series = annual[target_col].dropna()
-        if len(y_series) >= 10:
-            max_h = max(horizons)
-            bt_bsts = []
-            min_tr = max(8, len(y_series) - n_backtest - max_h)
-            for split in range(min_tr, len(y_series) - 1):
-                y_tr = y_series.iloc[:split]
-                try:
-                    mod = UnobservedComponents(y_tr, level="local linear trend")
-                    res = mod.fit(disp=False, maxiter=100)
-                    fcast = res.forecast(steps=min(max_h, len(y_series) - split))
-                    for h in range(1, max_h + 1):
-                        future_idx = split + h - 1
-                        if future_idx >= len(y_series) or h - 1 >= len(fcast): break
-                        bt_bsts.append({"year_origin": y_series.index[split - 1],
-                            "year_target": y_series.index[future_idx],
-                            "horizon": h, "predicted": fcast.iloc[h - 1],
-                            "actual": y_series.iloc[future_idx]})
-                except Exception:
-                    continue
-            if len(bt_bsts) >= 3:
-                bt_full_b = pd.DataFrame(bt_bsts)
-                bt_full_b["error"] = bt_full_b["predicted"] - bt_full_b["actual"]
-                bt_full_b["abs_pct_error"] = (bt_full_b["error"].abs() / bt_full_b["actual"].abs().clip(lower=0.01)) * 100
-                horizon_acc_b = {}
-                for h in horizons:
-                    bh = bt_full_b[bt_full_b["horizon"] == h]
-                    if not bh.empty:
-                        horizon_acc_b[h] = {"mape": bh["abs_pct_error"].mean(),
-                            "rmse": np.sqrt((bh["error"] ** 2).mean()), "n": len(bh)}
-                bt1_b = bt_full_b[bt_full_b["horizon"] == 1].copy().rename(columns={"year_target": "year"})
-                mape_b = bt1_b["abs_pct_error"].mean() if not bt1_b.empty else 999
-                std_err_b = bt1_b["error"].std() if len(bt1_b) > 1 else abs(y_series.iloc[-1]) * 0.05
-                # Final BSTS forecast
-                mod_f = UnobservedComponents(y_series, level="local linear trend")
-                res_f = mod_f.fit(disp=False, maxiter=100)
-                fcast_f = res_f.forecast(steps=max_h)
-                fc_list = []
-                base_year = int(y_series.index[-1])
-                for h in range(1, max_h + 1):
-                    h_err = std_err_b
-                    if h in horizon_acc_b and horizon_acc_b[h]["n"] > 1:
-                        h_err = bt_full_b[bt_full_b["horizon"] == h]["error"].std()
-                    fc_list.append({"year": base_year + h, "value": fcast_f.iloc[h - 1],
-                        "ci_low": fcast_f.iloc[h - 1] - 1.96 * h_err,
-                        "ci_high": fcast_f.iloc[h - 1] + 1.96 * h_err, "horizon": h})
-                fc_df_b = pd.DataFrame(fc_list)
-                hr_b = {}
-                for h in horizons:
-                    row = fc_df_b[fc_df_b["horizon"] == h]
-                    if not row.empty:
-                        r = row.iloc[0]
-                        hr_b[h] = {"year": int(r["year"]), "value": r["value"],
-                            "ci_low": r["ci_low"], "ci_high": r["ci_high"]}
-                wm_b = sum(horizon_acc_b[h]["mape"] * w for h, w in [(1,3),(2,2),(5,1)] if h in horizon_acc_b)
-                tw_b = sum(w for h, w in [(1,3),(2,2),(5,1)] if h in horizon_acc_b)
-                wm_b = wm_b / tw_b if tw_b > 0 else mape_b
-                # Use level/trend as pseudo-importance
-                coefs_b = pd.Series({"Level": 1.0, "Trend": 0.5})
-                result_bsts = {
-                    "backtest": bt1_b, "backtest_full": bt_full_b,
-                    "horizon_accuracy": horizon_acc_b,
-                    "mape": mape_b, "rmse": np.sqrt((bt1_b["error"]**2).mean()) if not bt1_b.empty else 0,
-                    "weighted_mape": wm_b, "forecasts": fc_df_b, "horizon_results": hr_b,
-                    "last_actual_year": base_year, "last_actual_val": y_series.iloc[-1],
-                    "importance": coefs_b, "n_train": len(y_series), "std_err": std_err_b,
-                    "detrended": False, "trend_coef": 0, "trend_intercept": 0,
-                }
-    except Exception:
-        result_bsts = None
     if target_col not in annual.columns or len(annual) < 8:
         return None
 
@@ -815,46 +472,32 @@ def run_forecast(annual, target_col, n_backtest=5, horizons=(1, 2, 5), panel_dat
 
     feature_cols = [c for c in clean.columns]
 
-    # Run single-county models
+    # Run both models
     result_standard = _run_single_forecast(clean, target_col, feature_cols, n_backtest, horizons, detrend=False)
     result_trend = _run_single_forecast(clean, target_col, feature_cols, n_backtest, horizons, detrend=True)
 
-    # Run panel model if panel data available
-    # Map target_col to county-level equivalent for panel
-    panel_target_map = {"unemp_philly": "unemp", "med_income": "med_income"}
-    panel_target = panel_target_map.get(target_col)
-    result_panel = None
-    if panel_data is not None and not panel_data.empty and panel_target and panel_target in panel_data.columns:
-        try:
-            result_panel = run_panel_forecast(panel_data, panel_target, "Philadelphia", n_backtest, horizons)
-        except Exception:
-            result_panel = None
-
-    # Collect all candidates
-    candidates = []
-    if result_standard: candidates.append(("standard", result_standard))
-    if result_trend: candidates.append(("trend-adjusted", result_trend))
-    if result_panel: candidates.append(("panel", result_panel))
-    if result_bsts: candidates.append(("bsts", result_bsts))
-
-    if not candidates:
+    # Select winner by weighted MAPE (favoring short-term accuracy)
+    if result_standard is None and result_trend is None:
         return None
-
-    # Select winner by weighted MAPE
-    best_name, best = min(candidates, key=lambda x: x[1].get("weighted_mape", 999))
+    elif result_standard is None:
+        best = result_trend
+    elif result_trend is None:
+        best = result_standard
+    else:
+        if result_trend["weighted_mape"] < result_standard["weighted_mape"]:
+            best = result_trend
+        else:
+            best = result_standard
 
     best["used_migration"] = used_migration
-    best["model_type"] = best_name
-
-    # Build comparison info
-    comp = {}
-    for name, res in candidates:
-        comp[f"{name}_mape"] = res.get("weighted_mape", 999)
-    comp["selected"] = best_name
-    if result_panel:
-        comp["panel_counties"] = result_panel.get("n_counties", 0)
-        comp["panel_obs"] = result_panel.get("panel_obs", 0)
-    best["model_comparison"] = comp
+    best["model_type"] = "trend-adjusted" if best.get("detrended") else "standard"
+    # Include comparison info
+    if result_standard and result_trend:
+        best["model_comparison"] = {
+            "standard_mape": result_standard["weighted_mape"],
+            "trend_mape": result_trend["weighted_mape"],
+            "selected": best["model_type"],
+        }
     return best
 
 # ── OPPORTUNITY AREA PREDICTION ──
@@ -1461,28 +1104,18 @@ with t_fc:
 
         annual, targets = build_annual_dataset(fd_full, migration_ts)
 
-        # Build panel dataset across all 9 counties
-        panel_data = pd.DataFrame()
-        if CENSUS_API_KEY:
-            with st.spinner("Building 9-county panel dataset…"):
-                try:
-                    panel_data = build_panel_dataset(fd_full, migration_ts)
-                except Exception:
-                    panel_data = pd.DataFrame()
-
         if annual.empty:
             st.warning("Not enough data to build forecasts.")
         else:
             mig_status = f" · Migration data: {len(migration_ts)} years ({int(migration_ts['year'].min())}–{int(migration_ts['year'].max())})" if not migration_ts.empty else " · No migration data"
-            panel_status = f" · Panel: {len(panel_data)} obs across {panel_data['county'].nunique()} counties" if not panel_data.empty and 'county' in panel_data.columns else ""
-            st.markdown(f"**{len(annual)} years** of annual data assembled ({int(annual.index.min())}–{int(annual.index.max())}){mig_status}{panel_status}")
+            st.markdown(f"**{len(annual)} years** of annual data assembled ({int(annual.index.min())}–{int(annual.index.max())}){mig_status}")
 
             for target_label, target_key in targets.items():
                 if target_key not in annual.columns:
                     continue
 
                 st.markdown(f'<div class="section-label">{target_label}</div>', unsafe_allow_html=True)
-                result = run_forecast(annual, target_key, panel_data=panel_data)
+                result = run_forecast(annual, target_key)
 
                 if result is None:
                     st.markdown("_Insufficient data for this forecast._")
@@ -1514,21 +1147,18 @@ with t_fc:
                                 help=f"95% CI: {fv(hr[h]['ci_low'])} – {fv(hr[h]['ci_high'])}")
                 with fc5:
                     mig_tag = " 🌍" if result.get("used_migration") else ""
-                    model_tags = {"trend-adjusted": " 📈", "panel": " 🏛️", "bsts": " 📊"}
-                    model_tag = model_tags.get(result.get("model_type"), "")
+                    model_tag = " 📈" if result.get("model_type") == "trend-adjusted" else ""
                     st.metric(f"Backtest MAPE{mig_tag}{model_tag}", f"{result['mape']:.1f}%",
                         help=f"Mean Absolute Percentage Error on walk-forward backtest. Lower = more accurate."
                              f"{' Migration features included.' if result.get('used_migration') else ' Migration features excluded.'}"
                              f" Model: {result.get('model_type', 'standard')}."
-                             f"{' 📈=trend-adjusted, 🏛️=panel (9-county), 🌍=migration' if model_tag else ''}")
+                             f"{' 📈=trend-adjusted, 🌍=migration' if model_tag else ''}")
                     # Show model comparison if available
                     mc = result.get("model_comparison")
                     if mc:
                         winner = mc["selected"]
-                        others = [f"{k.replace('_mape','')}: {v:.1f}%" for k, v in mc.items()
-                                  if k.endswith("_mape") and k.replace("_mape","") != winner]
-                        panel_info = f" ({mc['panel_counties']}co×{mc['panel_obs']}obs)" if "panel_counties" in mc else ""
-                        st.caption(f"✓ {winner.title()}{panel_info} selected (wMAPE {result['weighted_mape']:.1f}% vs {', '.join(others)})")
+                        loser_mape = mc["trend_mape"] if winner == "standard" else mc["standard_mape"]
+                        st.caption(f"✓ {winner.title()} selected (wMAPE {result['weighted_mape']:.1f}% vs {loser_mape:.1f}%)")
 
                 # Charts
                 bt = result["backtest"]
@@ -1667,7 +1297,7 @@ with t_fc:
 
 **MAPE:** Mean Absolute Percentage Error across all backtest windows. Under 5% is excellent; under 10% is good.
 
-**Limitations:** Annual frequency limits sample size. Model assumes linear relationships and stable regime. Structural breaks (pandemics, policy shifts) may not be captured. GDP data lags ~1 year from BEA.
+**Limitations:** Annual frequency limits sample size (~20 observations). Model assumes linear relationships and stable regime. Structural breaks (pandemics, policy shifts) may not be captured. GDP data lags ~1 year from BEA. Panel regression (9-county with fixed effects) and Bayesian structural time series (BSTS) were tested as alternative models but did not outperform on backtesting: the cross-county panel introduced too much heterogeneity, and BSTS without exogenous features could not beat Ridge with 12+ macro predictors. These may become viable as more years of data accumulate.
 """)
 
         # ── RATE SENSITIVITY ANALYSIS ──
@@ -1684,7 +1314,7 @@ with t_fc:
         sens_rows = []
         for target_label, target_key in targets.items():
             if target_key not in annual.columns: continue
-            result = run_forecast(annual, target_key, panel_data=panel_data)
+            result = run_forecast(annual, target_key)
             if result is None: continue
             hr = result.get("horizon_results", {})
             if 1 not in hr: continue
@@ -1766,7 +1396,7 @@ with t_fc:
         tracker_rows = []
         for target_label, target_key in targets.items():
             if target_key not in annual.columns: continue
-            result = run_forecast(annual, target_key, panel_data=panel_data)
+            result = run_forecast(annual, target_key)
             if result is None: continue
             hr = result.get("horizon_results", {})
             for h in [1, 2, 5]:
@@ -1820,7 +1450,7 @@ with t_fc:
                 macro_h = {}
                 for tl, tk in targets.items():
                     if tk in annual.columns:
-                        r = run_forecast(annual, tk, panel_data=panel_data)
+                        r = run_forecast(annual, tk)
                         if r and r.get("horizon_results") and h in r["horizon_results"]:
                             macro_h[tl] = {
                                 "forecast_val": r["horizon_results"][h]["value"],
