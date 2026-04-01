@@ -96,7 +96,7 @@ def tip(key):
     return TT.get(key, "")
 
 # ── DATA FETCHING ──
-@st.cache_data(ttl=3600*6, show_spinner=False)
+@st.cache_data(ttl=3600*6+1, show_spinner=False)
 def fetch_fred(sid, start="2010-01-01"):
     if not FRED_API_KEY: return pd.DataFrame(columns=["date","value"])
     try:
@@ -420,7 +420,7 @@ def build_annual_dataset(fd, migration_df=None, zillow_zori_metro=None, zhvi_fre
         zhvi_annual = zhvi.groupby("year")["value"].last().rename("zhvi_pa")
         frames["zhvi_pa"] = zhvi_annual
     if not frames: return pd.DataFrame(), targets
-    annual = pd.concat(frames.values(), axis=1).dropna(how="all")
+    annual = pd.concat(frames.values(), axis=1).dropna(how="all").sort_index()
     # Exclude current incomplete year to avoid partial-year bias
     current_year = datetime.now().year
     annual = annual[annual.index < current_year]
@@ -431,6 +431,7 @@ def _run_single_forecast(clean, target_col, feature_cols, n_backtest=5, horizons
     from sklearn.linear_model import Ridge, LinearRegression
     from sklearn.preprocessing import StandardScaler
 
+    clean = clean.sort_index()  # ensure chronological order
     y_raw = clean[target_col].copy()
     trend_coef, trend_intercept = 0.0, 0.0
 
@@ -576,6 +577,7 @@ def run_forecast(annual, target_col, n_backtest=5, horizons=(1, 2, 5)):
     """Run standard and trend-adjusted forecasts, auto-select the better model by backtest."""
     from sklearn.linear_model import Ridge
     from sklearn.preprocessing import StandardScaler
+    annual = annual.sort_index()  # guarantee chronological order
     if target_col not in annual.columns or len(annual) < 8:
         return None
 
