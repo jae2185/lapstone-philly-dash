@@ -515,7 +515,7 @@ def _run_single_forecast(clean, target_col, feature_cols, n_backtest=5, horizons
 
     # Multi-horizon forecast
     last_known = clean[feature_cols].iloc[-1:].copy()
-    base_year = int(clean.index[-1])
+    base_year = int(y_raw.index[-1])
     n_total = len(y_raw)
     forecasts = []
     simulated_row = last_known.copy()
