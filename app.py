@@ -432,8 +432,6 @@ def _run_single_forecast(clean, target_col, feature_cols, n_backtest=5, horizons
     from sklearn.preprocessing import StandardScaler
 
     y_raw = clean[target_col].copy()
-    import streamlit as _st
-    _st.write(f"DEBUG y_raw.index: {list(y_raw.index)[-5:]} | last={y_raw.index[-1]} | dtype={y_raw.index.dtype}")
     trend_coef, trend_intercept = 0.0, 0.0
 
     if detrend:
